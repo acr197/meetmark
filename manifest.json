@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "MeetMark",
+  "version": "1.0.0",
+  "description": "Export Microsoft Teams meeting transcripts to clean Markdown files, optimized for AI tools. All processing runs locally.",
+  "permissions": [
+    "activeTab",
+    "downloads",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://teams.microsoft.com/*",
+    "https://*.teams.microsoft.com/*"
+  ],
+  "action": {
+    "default_title": "MeetMark - Export Teams transcript",
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}
