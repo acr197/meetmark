@@ -33,12 +33,17 @@ it as an unpacked extension in developer mode.
 
 ## Using it
 
-1. Open a Microsoft Teams meeting transcript page in a tab.
-2. Wait for the transcript view to render.
+1. Open a Microsoft Teams meeting recording in your browser. For most
+   tenants this is a SharePoint Stream page with a URL like
+   `https://<tenant>-my.sharepoint.com/.../stream.aspx?id=...`.
+2. Click the **Transcript** button on the right side of the player so the
+   transcript panel is visible. Wait for it to render.
 3. Click the MeetMark toolbar button.
 4. Click **Export transcript**.
-5. The extension will scroll the transcript to load all content, scrape it,
-   clean it up, and download a `.md` file to your default downloads folder.
+5. The extension will scroll the transcript panel to load all content,
+   scrape it, clean it up, and download a `.md` file named
+   `YYYY.MM.DD - {Meeting Title} Transcript.md` to your default downloads
+   folder.
 
 ## Troubleshooting
 

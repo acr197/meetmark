@@ -13,15 +13,24 @@ document.addEventListener("DOMContentLoaded", () => {
     status.className = "status " + (level || "info");
   }
 
-  // Check whether a URL looks like a Microsoft Teams page we can scrape.
-  function isTeamsUrl(url) {
+  // Check whether a URL looks like a page we can scrape: either a Microsoft
+  // Teams transcript page, or a SharePoint Stream recording page (stream.aspx)
+  // which is where Teams meeting recordings and transcripts actually live for
+  // many tenants.
+  function isSupportedUrl(url) {
     if (!url) return false;
     try {
       const u = new URL(url);
-      return (
+      if (
         u.hostname === "teams.microsoft.com" ||
         u.hostname.endsWith(".teams.microsoft.com")
-      );
+      ) {
+        return true;
+      }
+      if (u.hostname.endsWith(".sharepoint.com")) {
+        return true;
+      }
+      return false;
     } catch (_) {
       return false;
     }
@@ -44,9 +53,9 @@ document.addEventListener("DOMContentLoaded", () => {
         return;
       }
 
-      if (!isTeamsUrl(tab.url)) {
+      if (!isSupportedUrl(tab.url)) {
         setStatus(
-          "This tab doesn't look like a Microsoft Teams page. Open a Teams transcript and try again.",
+          "This tab doesn't look like a Teams or SharePoint Stream page. Open a Teams recording with the transcript panel visible and try again.",
           "error"
         );
         button.disabled = false;
