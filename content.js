@@ -1,5 +1,7 @@
 // MeetMark content script.
-// Injected into a Microsoft Teams transcript page on demand. Responsible for:
+// Injected into a Microsoft Teams transcript page, or a SharePoint Stream
+// recording page (stream.aspx) where Teams meeting recordings are served,
+// on demand. Responsible for:
 //   1) scrolling the page so all lazy-loaded transcript chunks render
 //   2) scraping the DOM for speaker / timestamp / utterance triples
 //   3) cleaning up known Teams text artifacts
@@ -53,7 +55,7 @@
       return {
         ok: false,
         error:
-          "Could not find transcript content. Make sure you're on a Teams transcript page and it has fully loaded.",
+          "Could not find transcript content. Open the Teams meeting recording in SharePoint Stream, click 'Transcript' to show the transcript panel, let it load, then try again.",
       };
     }
 
@@ -73,15 +75,16 @@
       return {
         ok: false,
         error:
-          "Could not find transcript content. Make sure you're on a Teams transcript page and it has fully loaded.",
+          "Could not find transcript content. Open the Teams meeting recording in SharePoint Stream, click 'Transcript' to show the transcript panel, let it load, then try again.",
       };
     }
 
     const cleanedTurns = turns.map(cleanTurn).filter((t) => t.text.length > 0);
     const mergedTurns = mergeAdjacentTurns(cleanedTurns);
     const participants = collectParticipants(mergedTurns);
-    const markdown = formatMarkdown(mergedTurns, participants);
-    const filename = buildFilename();
+    const metadata = extractMeetingMetadata();
+    const markdown = formatMarkdown(mergedTurns, participants, metadata);
+    const filename = buildFilename(metadata);
 
     return {
       ok: true,
@@ -128,10 +131,21 @@
     return [];
   }
 
-  // Locate the scroll-container that holds the transcript. Teams reuses a
-  // handful of class names depending on the surface, so we try several.
+  // Locate the scroll-container that holds the transcript. Teams and
+  // SharePoint Stream reuse a handful of class names depending on the
+  // surface, so we try several. The Stream page (stream.aspx) is where most
+  // tenants serve Teams meeting recordings and their transcripts.
   function findTranscriptContainer() {
     const containerSelectors = [
+      // SharePoint Stream (stream.aspx) transcript panel.
+      '[data-automationid="transcript-virtualized-list"]',
+      '[data-automationid="transcriptList"]',
+      '[data-automationid="transcript-list"]',
+      '[data-automationid="transcript-panel"] [role="list"]',
+      '[data-automationid="transcript-panel"]',
+      'div[aria-label="Transcript"] [role="list"]',
+      'div[aria-label="Transcript"]',
+      // Teams native surfaces.
       '[data-tid="transcript-list"]',
       '[data-tid="transcriptList"]',
       '[data-tid="closed-caption-renderer"]',
@@ -237,9 +251,16 @@
   // record has { speaker, timestamp, text }.
   function scrapeTurns(container) {
     const rowSelectors = [
+      // SharePoint Stream (stream.aspx) transcript entries.
+      '[data-automationid="transcript-item"]',
+      '[data-automationid="transcriptItem"]',
+      '[data-automationid="transcriptListItem"]',
+      '[data-automationid="transcript-entry"]',
+      // Teams native.
       '[data-tid="transcript-list-item"]',
       '[data-tid="transcriptListItem"]',
       '[data-tid="closed-caption-row"]',
+      // Generic.
       'div[role="listitem"]',
       ".ts-transcript-entry",
       ".transcript-list-item",
@@ -266,24 +287,42 @@
   // match (which makes us resilient to renames).
   function extractTurnFromRow(row) {
     const speakerSelectors = [
+      // SharePoint Stream.
+      '[data-automationid="transcript-item-author"]',
+      '[data-automationid="transcriptAuthor"]',
+      '[data-automationid="author"]',
+      // Teams native.
       '[data-tid="author"]',
       '[data-tid="transcript-author"]',
       '[data-tid="closed-caption-author"]',
+      // Generic.
       ".ts-transcript-author",
       ".author",
       ".speaker-name",
     ];
     const timestampSelectors = [
+      // SharePoint Stream.
+      '[data-automationid="transcript-item-timestamp"]',
+      '[data-automationid="transcriptTimestamp"]',
+      '[data-automationid="timestamp"]',
+      // Teams native.
       '[data-tid="timestamp"]',
       '[data-tid="transcript-timestamp"]',
       '[data-tid="closed-caption-timestamp"]',
+      // Generic.
       ".ts-transcript-timestamp",
       ".timestamp",
       "time",
     ];
     const textSelectors = [
+      // SharePoint Stream.
+      '[data-automationid="transcript-item-text"]',
+      '[data-automationid="transcriptText"]',
+      '[data-automationid="transcript-text"]',
+      // Teams native.
       '[data-tid="transcript-text"]',
       '[data-tid="closed-caption-text"]',
+      // Generic.
       ".ts-transcript-text",
       ".transcript-text",
       ".caption-text",
@@ -506,19 +545,136 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Metadata extraction
+  // ---------------------------------------------------------------------------
+
+  // Pull { title, date, url } describing the meeting from the page.
+  //
+  // The page shows the meeting title and date below the video player in the
+  // SharePoint Stream view. We look for a heading element with the title and
+  // a nearby date string like "April 2, 2026". Both have sensible fallbacks.
+  function extractMeetingMetadata() {
+    return {
+      title: extractMeetingTitle(),
+      date: extractMeetingDate(),
+      url: location.href,
+    };
+  }
+
+  // Find the meeting title. Tries Stream-specific heading hooks first, then
+  // any H1/H2 on the page, then falls back to parsing document.title.
+  function extractMeetingTitle() {
+    const titleSelectors = [
+      '[data-automationid="videoTitle"]',
+      '[data-automationid="video-title"]',
+      '[data-automationid="pageTitle"]',
+      '[data-automationid="DocumentTitle"]',
+      '[data-automationid="titleField"]',
+      "main h1",
+      "h1",
+      "h2",
+    ];
+    for (const sel of titleSelectors) {
+      const el = document.querySelector(sel);
+      if (!el) continue;
+      const t = extractText(el).replace(/\s+/g, " ").trim();
+      if (t && t.length >= 2 && t.length < 200) {
+        console.log("[MeetMark] title matched selector: " + sel);
+        return stripTitleNoise(t);
+      }
+    }
+    return stripTitleNoise((document.title || "").trim());
+  }
+
+  // Strip filename-looking suffixes and tab-title chrome from a title string.
+  // Examples:
+  //   "Novartis Spend Classifications-20260402_120001-Meeting Recording.mp4"
+  //     -> "Novartis Spend Classifications"
+  //   "Novartis Spend Classifications | Microsoft Stream"
+  //     -> "Novartis Spend Classifications"
+  function stripTitleNoise(title) {
+    if (!title) return "";
+    let out = title;
+    // Drop trailing app/site tags after " | " or " - ".
+    out = out.replace(
+      /\s*[|\-]\s*(Microsoft Teams|Microsoft Stream|SharePoint|OneDrive).*$/i,
+      ""
+    );
+    // Drop trailing file extension like .mp4 / .webm.
+    out = out.replace(/\.[a-z0-9]{2,5}$/i, "");
+    // Drop a trailing "-Meeting Recording" tag that Stream appends.
+    out = out.replace(/[-_\s]+Meeting Recording\s*$/i, "");
+    // Drop a trailing "-YYYYMMDD_HHMMSS" timestamp suffix, with or without
+    // further text after it.
+    out = out.replace(/[-_\s]+\d{8}[_-]?\d{0,6}.*$/i, "");
+    // Collapse internal whitespace.
+    out = out.replace(/\s+/g, " ").trim();
+    return out;
+  }
+
+  // Find the meeting date. Looks for a "Month D, YYYY" string visible on the
+  // page near the title; falls back to any such string in the document; falls
+  // back to today.
+  function extractMeetingDate() {
+    const monthName =
+      "(January|February|March|April|May|June|July|August|September|October|November|December)";
+    const longPattern = new RegExp(monthName + "\\s+(\\d{1,2}),?\\s+(\\d{4})", "i");
+    const shortPattern = /\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})\b/;
+
+    const scopes = [
+      document.querySelector("main"),
+      document.body,
+    ].filter(Boolean);
+
+    for (const scope of scopes) {
+      const text = (scope.innerText || "").slice(0, 20000);
+      const longMatch = text.match(longPattern);
+      if (longMatch) {
+        const parsed = new Date(longMatch[0]);
+        if (!isNaN(parsed.getTime())) {
+          console.log("[MeetMark] date matched long pattern: " + longMatch[0]);
+          return parsed;
+        }
+      }
+      const shortMatch = text.match(shortPattern);
+      if (shortMatch) {
+        const parsed = new Date(
+          parseInt(shortMatch[3], 10),
+          parseInt(shortMatch[1], 10) - 1,
+          parseInt(shortMatch[2], 10)
+        );
+        if (!isNaN(parsed.getTime())) {
+          console.log("[MeetMark] date matched short pattern: " + shortMatch[0]);
+          return parsed;
+        }
+      }
+    }
+
+    console.log("[MeetMark] no meeting date found, using today");
+    return new Date();
+  }
+
+  // ---------------------------------------------------------------------------
   // Formatting
   // ---------------------------------------------------------------------------
 
-  // Render the final Markdown document. Two trailing spaces after the date /
-  // source / participants lines force Markdown line breaks.
-  function formatMarkdown(turns, participants) {
-    const meetingDate = todayDateISO();
+  // Render the final Markdown document. Two trailing spaces after each header
+  // line force Markdown line breaks.
+  function formatMarkdown(turns, participants, metadata) {
     const exportStamp = nowLocalStamp();
+    const meetingDateIso = formatDateIso(metadata.date);
 
     const lines = [];
-    lines.push("# Meeting Transcript");
-    lines.push("**Date:** " + meetingDate + "  ");
-    lines.push("**Source:** Microsoft Teams  ");
+    lines.push("# " + (metadata.title || "Meeting Transcript"));
+    lines.push("");
+    if (metadata.title) {
+      lines.push("**Title:** " + metadata.title + "  ");
+    }
+    lines.push("**Date:** " + meetingDateIso + "  ");
+    lines.push("**Source:** Microsoft Teams (via SharePoint Stream)  ");
+    if (metadata.url) {
+      lines.push("**Link:** " + metadata.url + "  ");
+    }
     lines.push(
       "**Participants:** " +
         (participants.length > 0 ? participants.join(", ") : "Unknown")
@@ -544,52 +700,47 @@
     return lines.join("\n");
   }
 
-  // Today's date in YYYY-MM-DD form, in the user's local timezone.
-  function todayDateISO() {
-    const d = new Date();
+  // Format a Date in YYYY-MM-DD form using local time.
+  function formatDateIso(d) {
     const y = d.getFullYear();
     const m = String(d.getMonth() + 1).padStart(2, "0");
     const day = String(d.getDate()).padStart(2, "0");
     return y + "-" + m + "-" + day;
   }
 
+  // Format a Date in YYYY.MM.DD form for use inside a filename.
+  function formatDateDotted(d) {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, "0");
+    const day = String(d.getDate()).padStart(2, "0");
+    return y + "." + m + "." + day;
+  }
+
   // A human-readable local timestamp for the export footer, e.g.
   // "2026-04-08 at 14:32 PDT".
   function nowLocalStamp() {
     const d = new Date();
-    const y = d.getFullYear();
-    const m = String(d.getMonth() + 1).padStart(2, "0");
-    const day = String(d.getDate()).padStart(2, "0");
     const hh = String(d.getHours()).padStart(2, "0");
     const mm = String(d.getMinutes()).padStart(2, "0");
     const tzMatch = d.toString().match(/\(([^)]+)\)$/);
     const tz = tzMatch ? tzMatch[1] : "local time";
-    return y + "-" + m + "-" + day + " at " + hh + ":" + mm + " " + tz;
+    return formatDateIso(d) + " at " + hh + ":" + mm + " " + tz;
   }
 
   // ---------------------------------------------------------------------------
   // Filename
   // ---------------------------------------------------------------------------
 
-  // Build a download filename: prefer the meeting/tab title, fall back to a
-  // dated default. Always ends in .md and contains no path separators.
-  function buildFilename() {
-    const date = todayDateISO();
-    const rawTitle = (document.title || "").trim();
-    const cleanedTitle = sanitizeFilename(stripCommonTitleNoise(rawTitle));
-    if (cleanedTitle) {
-      return cleanedTitle + ".md";
+  // Build a download filename in the format
+  //   "YYYY.MM.DD - {Meeting Title} Transcript.md"
+  // using the title and date extracted from the page, with safe fallbacks.
+  function buildFilename(metadata) {
+    const datePart = formatDateDotted(metadata.date || new Date());
+    const titlePart = sanitizeFilename(metadata.title || "");
+    if (titlePart) {
+      return datePart + " - " + titlePart + " Transcript.md";
     }
-    return "transcript-" + date + ".md";
-  }
-
-  // Strip common Teams tab-title noise like " | Microsoft Teams".
-  function stripCommonTitleNoise(title) {
-    if (!title) return "";
-    return title
-      .replace(/\s*[|\-]\s*Microsoft Teams.*$/i, "")
-      .replace(/\s*\(\d+\)\s*/g, " ")
-      .trim();
+    return datePart + " - Transcript.md";
   }
 
   // Replace characters that aren't safe in filenames on common OSes.

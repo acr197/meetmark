@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "MeetMark",
   "version": "1.0.0",
-  "description": "Export Microsoft Teams meeting transcripts to clean Markdown files, optimized for AI tools. All processing runs locally.",
+  "description": "Export Microsoft Teams meeting transcripts (including SharePoint Stream recordings) to clean Markdown files, optimized for AI tools. All processing runs locally.",
   "permissions": [
     "activeTab",
     "downloads",
@@ -10,7 +10,8 @@
   ],
   "host_permissions": [
     "https://teams.microsoft.com/*",
-    "https://*.teams.microsoft.com/*"
+    "https://*.teams.microsoft.com/*",
+    "https://*.sharepoint.com/*"
   ],
   "action": {
     "default_title": "MeetMark - Export Teams transcript",
