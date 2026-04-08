@@ -50,7 +50,16 @@
   // Top-level orchestration. Returns { ok, markdown, filename, warning } or
   // { ok: false, error }.
   async function runExport() {
-    const container = findTranscriptContainer();
+    // If the transcript panel isn't open yet, try to click the Transcript
+    // button in the Stream player sidebar. On SharePoint Stream the URL does
+    // not change when the panel opens, so this is the only hint we have.
+    let container = findTranscriptContainer();
+    if (!container) {
+      const opened = await ensureTranscriptPanelOpen();
+      if (opened) {
+        container = findTranscriptContainer();
+      }
+    }
     if (!container) {
       return {
         ok: false,
@@ -59,19 +68,25 @@
       };
     }
 
-    let warning = null;
+    // Collect turns while scrolling. Stream uses a virtualized list, so rows
+    // outside the viewport are removed from the DOM; we must scrape at every
+    // scroll step and dedupe, not just scrape once at the end.
+    let collectResult;
     try {
-      const scrollResult = await scrollAllContent(container);
-      if (scrollResult && scrollResult.timedOut) {
-        warning =
-          "Scroll timed out before all content loaded. Exporting what was visible.";
-      }
+      collectResult = await scrollAndCollectTurns(container);
     } catch (err) {
-      warning = "Scroll error: " + ((err && err.message) || String(err));
+      return {
+        ok: false,
+        error: "Scroll/scrape error: " + ((err && err.message) || String(err)),
+      };
     }
 
-    const turns = scrapeTurns(container);
-    if (!turns || turns.length === 0) {
+    const warning = collectResult.timedOut
+      ? "Scroll timed out before all content loaded. Exporting what was collected."
+      : null;
+
+    const rawTurns = collectResult.turns || [];
+    if (rawTurns.length === 0) {
       return {
         ok: false,
         error:
@@ -79,7 +94,9 @@
       };
     }
 
-    const cleanedTurns = turns.map(cleanTurn).filter((t) => t.text.length > 0);
+    const cleanedTurns = rawTurns
+      .map(cleanTurn)
+      .filter((t) => t.text.length > 0 || t.speaker.length > 0);
     const mergedTurns = mergeAdjacentTurns(cleanedTurns);
     const participants = collectParticipants(mergedTurns);
     const metadata = extractMeetingMetadata();
@@ -163,7 +180,54 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Scrolling
+  // Transcript panel auto-open
+  // ---------------------------------------------------------------------------
+
+  // If the user is on a SharePoint Stream page but has not clicked the
+  // "Transcript" button yet, the transcript panel isn't in the DOM. Look for
+  // the sidebar button by aria-label and click it. Returns true if the panel
+  // appears (or was already open) within a few seconds.
+  async function ensureTranscriptPanelOpen() {
+    if (findTranscriptContainer()) return true;
+
+    const buttonSelectors = [
+      'button[aria-label="Transcript"][role="menuitem"]',
+      'button[aria-label="Transcript"]',
+      'button[aria-label*="ranscript"][role="menuitem"]',
+      'button[aria-label*="ranscript"]',
+      '[role="menuitem"][aria-label="Transcript"]',
+    ];
+
+    let clicked = false;
+    for (const sel of buttonSelectors) {
+      const btn = document.querySelector(sel);
+      if (btn) {
+        console.log("[MeetMark] clicking transcript button: " + sel);
+        try {
+          btn.click();
+          clicked = true;
+          break;
+        } catch (err) {
+          console.warn("[MeetMark] click failed: " + err);
+        }
+      }
+    }
+
+    if (!clicked) {
+      console.log("[MeetMark] no transcript button found");
+      return false;
+    }
+
+    // Poll for the panel to materialize.
+    for (let i = 0; i < 24; i++) {
+      await sleep(250);
+      if (findTranscriptContainer()) return true;
+    }
+    return false;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Scrolling + incremental scraping
   // ---------------------------------------------------------------------------
 
   // Promise-based sleep helper.
@@ -171,9 +235,9 @@
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  // Determine which element actually scrolls. Some Teams surfaces scroll the
-  // container itself; others scroll a parent. Walk up until we find one whose
-  // scrollHeight exceeds its clientHeight.
+  // Determine which element actually scrolls. Some surfaces scroll the
+  // container itself; others scroll a parent. Walk up until we find one
+  // whose scrollHeight exceeds its clientHeight by a meaningful margin.
   function findScroller(start) {
     let node = start;
     while (node && node !== document.body) {
@@ -185,60 +249,126 @@
     return document.scrollingElement || document.documentElement;
   }
 
-  // Scroll incrementally to the bottom, then back to the top, allowing
-  // virtualized rows to render. Returns { timedOut: boolean }.
-  async function scrollAllContent(container) {
+  // Build a dedupe key for a turn. We key on speaker + timestamp + a prefix of
+  // the text so that the same row captured by two different scroll positions
+  // only ends up in the output once.
+  function turnKey(turn) {
+    const speaker = (turn.speaker || "").toLowerCase().trim();
+    const ts = (turn.timestamp || "").trim();
+    const textPrefix = (turn.text || "").slice(0, 80).toLowerCase().trim();
+    return speaker + "|" + ts + "|" + textPrefix;
+  }
+
+  // Scroll incrementally from the top of the transcript to the bottom,
+  // scraping visible rows at every step. Because the list is virtualized,
+  // rows outside the viewport get removed from the DOM; scraping at every
+  // step and deduping by { speaker, timestamp, text-prefix } is the only
+  // way to collect the full transcript.
+  //
+  // Returns { turns, timedOut }.
+  async function scrollAndCollectTurns(container) {
     const scroller = findScroller(container);
+    const collected = new Map();
+    const collectOrder = [];
+
+    // Push a turn into the collection, preserving first-seen order.
+    function absorb(turn) {
+      if (!turn) return;
+      if (!turn.speaker && !turn.text) return;
+      const key = turnKey(turn);
+      if (collected.has(key)) return;
+      collected.set(key, turn);
+      collectOrder.push(key);
+    }
+
+    // Scrape whatever is currently rendered in the panel.
+    function scrapeOnce() {
+      const turns = scrapeTurns(container);
+      for (const t of turns) absorb(t);
+    }
+
     const startTime = Date.now();
 
-    // First push the scroller to the very top so any "scroll up to load
-    // earlier" behaviors get a chance.
+    // Start at the very top so rows render from the beginning of the meeting.
     scroller.scrollTop = 0;
     await sleep(SETTLE_DELAY_MS);
+    scrapeOnce();
 
+    let stableAtBottom = 0;
+    let stableStuck = 0;
+    let lastScrollTop = -1;
     let lastHeight = -1;
-    let stableLoops = 0;
 
+    // The outer loop drives the scroll downward until we have been at the
+    // very bottom, with stable scrollHeight, for several consecutive checks.
+    // We deliberately require multiple stable confirmations because Stream's
+    // virtualized list grows its scrollHeight as new rows are fetched.
     while (true) {
       if (Date.now() - startTime > MAX_SCROLL_MS) {
-        return { timedOut: true };
+        scroller.scrollTop = 0;
+        return {
+          turns: collectOrder.map((k) => collected.get(k)),
+          timedOut: true,
+        };
       }
 
-      const currentHeight = scroller.scrollHeight;
+      const beforeScroll = scroller.scrollTop;
+      const beforeHeight = scroller.scrollHeight;
       const viewport = scroller.clientHeight || window.innerHeight || 600;
-      const target = scroller.scrollTop + viewport * 0.8;
 
-      scroller.scrollTop = target;
+      // Advance by ~70% of viewport height so there is overlap between scrape
+      // steps and no row gets skipped.
+      scroller.scrollTop = beforeScroll + viewport * 0.7;
       await sleep(SCROLL_STEP_DELAY_MS);
+      scrapeOnce();
 
-      // Bottom reached? wait, then check if anything new appeared.
-      if (
-        scroller.scrollTop + scroller.clientHeight >=
-        scroller.scrollHeight - 4
-      ) {
+      const afterScroll = scroller.scrollTop;
+      const afterHeight = scroller.scrollHeight;
+      const atBottom =
+        afterScroll + scroller.clientHeight >= afterHeight - 4;
+
+      if (atBottom) {
+        // Wait for any trailing lazy fetches to land, then re-scrape.
         await sleep(SETTLE_DELAY_MS);
-        if (scroller.scrollHeight === currentHeight) {
-          stableLoops += 1;
-          if (stableLoops >= 2) {
-            // Scroll back to top so the user isn't left at the bottom.
+        scrapeOnce();
+        // Jump to the exact bottom to trigger any "almost there" fetches.
+        scroller.scrollTop = scroller.scrollHeight;
+        await sleep(SETTLE_DELAY_MS);
+        scrapeOnce();
+
+        if (scroller.scrollHeight === afterHeight) {
+          stableAtBottom += 1;
+          if (stableAtBottom >= 4) {
+            // Truly done. Reset scroll position for the user's convenience.
             scroller.scrollTop = 0;
-            return { timedOut: false };
+            return {
+              turns: collectOrder.map((k) => collected.get(k)),
+              timedOut: false,
+            };
           }
         } else {
-          stableLoops = 0;
-        }
-      }
-
-      // Track height progress so we don't loop forever on a stuck page.
-      if (currentHeight === lastHeight) {
-        stableLoops += 1;
-        if (stableLoops >= 6) {
-          scroller.scrollTop = 0;
-          return { timedOut: false };
+          stableAtBottom = 0;
         }
       } else {
-        stableLoops = 0;
-        lastHeight = currentHeight;
+        stableAtBottom = 0;
+      }
+
+      // Guard against a stuck scroller (e.g. transcript shorter than the
+      // viewport). If neither the scrollTop nor the scrollHeight has changed
+      // for several consecutive iterations, assume we're done.
+      if (afterScroll === lastScrollTop && afterHeight === lastHeight) {
+        stableStuck += 1;
+        if (stableStuck >= 6) {
+          scroller.scrollTop = 0;
+          return {
+            turns: collectOrder.map((k) => collected.get(k)),
+            timedOut: false,
+          };
+        }
+      } else {
+        stableStuck = 0;
+        lastScrollTop = afterScroll;
+        lastHeight = afterHeight;
       }
     }
   }
@@ -247,9 +377,36 @@
   // Scraping
   // ---------------------------------------------------------------------------
 
-  // Walk the container and pull out one record per transcript row. Each
-  // record has { speaker, timestamp, text }.
+  // Walk the container and pull out one record per transcript row.
+  //
+  // On SharePoint Stream the DOM classes vary between tenants and releases,
+  // so we use a pattern-based scraper that walks visible text leaves and
+  // groups them into turns based on the Name -> HH:MM -> Text pattern. If
+  // that yields nothing we fall back to the class/attribute-driven scraper
+  // which works for native Teams surfaces.
   function scrapeTurns(container) {
+    const host = (location.hostname || "").toLowerCase();
+    const isSharePoint = host.endsWith(".sharepoint.com");
+
+    if (isSharePoint) {
+      const patternTurns = scrapeTurnsByPattern(container);
+      if (patternTurns.length > 0) return patternTurns;
+    }
+
+    const selectorTurns = scrapeTurnsBySelector(container);
+    if (selectorTurns.length > 0) return selectorTurns;
+
+    // Last resort: try the pattern scraper even on Teams native pages. It's
+    // slower but doesn't need class names.
+    if (!isSharePoint) {
+      return scrapeTurnsByPattern(container);
+    }
+    return [];
+  }
+
+  // The original selector/attribute-driven scraper. Good for Teams native
+  // surfaces where data-tid attributes are stable.
+  function scrapeTurnsBySelector(container) {
     const rowSelectors = [
       // SharePoint Stream (stream.aspx) transcript entries.
       '[data-automationid="transcript-item"]',
@@ -280,6 +437,198 @@
       }
     });
     return turns;
+  }
+
+  // Pattern-based scraper. Walks visible text-leaf elements inside the
+  // transcript container in document order, then groups them into turns
+  // based on the Name -> HH:MM -> Text pattern that every Teams/Stream
+  // transcript follows regardless of class naming.
+  function scrapeTurnsByPattern(container) {
+    const chunks = collectTextChunks(container);
+    return groupChunksIntoTurns(chunks);
+  }
+
+  // Pattern that matches a bare timestamp like "7:24", "12:05", or
+  // "1:02:35". Used to identify header rows in the text-chunk stream.
+  const TIME_ONLY_RE = /^\s*\d{1,3}:\d{2}(?::\d{2})?\s*$/;
+  const TIME_ANYWHERE_RE = /\d{1,3}:\d{2}(?::\d{2})?/;
+
+  // A single-chunk header like "Jacqueline Derron 7:24" where the speaker
+  // name is followed by a timestamp (and nothing else).
+  const NAME_AND_TIME_RE =
+    /^(.{1,80}?)\s+(\d{1,3}:\d{2}(?::\d{2})?)\s*$/;
+
+  // "Name 7:24 Text..." — everything packed into one chunk.
+  const NAME_TIME_TEXT_RE =
+    /^(.{1,80}?)\s+(\d{1,3}:\d{2}(?::\d{2})?)\s+([\s\S]+)$/;
+
+  // Decide whether a string looks like a speaker name candidate: short-ish,
+  // no timestamp, no sentence punctuation at the end.
+  function looksLikeName(s) {
+    if (!s) return false;
+    const trimmed = s.trim();
+    if (trimmed.length < 2 || trimmed.length > 80) return false;
+    if (TIME_ANYWHERE_RE.test(trimmed)) return false;
+    // Sentences usually end with a period / question mark / exclamation.
+    if (/[.!?]$/.test(trimmed) && trimmed.length > 30) return false;
+    return true;
+  }
+
+  // Try to interpret the chunks at position i as the start of a new turn.
+  // Returns { turn, consumed, hasInlineText } or null.
+  function parseHeaderAt(chunks, i) {
+    const c1 = chunks[i];
+    if (!c1) return null;
+
+    // Case A: "Name TIME Text..." all in one chunk.
+    const m3 = c1.text.match(NAME_TIME_TEXT_RE);
+    if (m3 && looksLikeName(m3[1])) {
+      return {
+        turn: {
+          speaker: m3[1].trim(),
+          timestamp: m3[2],
+          text: m3[3].trim(),
+        },
+        consumed: 1,
+        hasInlineText: true,
+      };
+    }
+
+    // Case B: "Name TIME" alone in one chunk.
+    const m2 = c1.text.match(NAME_AND_TIME_RE);
+    if (m2 && looksLikeName(m2[1])) {
+      return {
+        turn: {
+          speaker: m2[1].trim(),
+          timestamp: m2[2],
+          text: "",
+        },
+        consumed: 1,
+        hasInlineText: false,
+      };
+    }
+
+    // Case C: "Name" and "TIME" in two consecutive chunks.
+    const c2 = chunks[i + 1];
+    if (c2 && TIME_ONLY_RE.test(c2.text) && looksLikeName(c1.text)) {
+      return {
+        turn: {
+          speaker: c1.text.trim(),
+          timestamp: c2.text.trim(),
+          text: "",
+        },
+        consumed: 2,
+        hasInlineText: false,
+      };
+    }
+
+    return null;
+  }
+
+  // Iterate through the chunk stream, identifying header boundaries and
+  // grouping the text chunks between them into a single utterance per turn.
+  function groupChunksIntoTurns(chunks) {
+    const turns = [];
+    let i = 0;
+    while (i < chunks.length) {
+      const header = parseHeaderAt(chunks, i);
+      if (!header) {
+        i += 1;
+        continue;
+      }
+
+      i += header.consumed;
+      const turn = header.turn;
+
+      if (!header.hasInlineText) {
+        const textParts = [];
+        while (i < chunks.length) {
+          if (parseHeaderAt(chunks, i)) break;
+          textParts.push(chunks[i].text);
+          i += 1;
+        }
+        turn.text = textParts.join(" ").replace(/\s+/g, " ").trim();
+      }
+
+      turns.push(turn);
+    }
+    return turns;
+  }
+
+  // Walk the container's descendants in document order and collect every
+  // visible text-leaf element's trimmed text as a chunk. A "text leaf" is an
+  // element whose own text content isn't already covered by a child element
+  // (so we don't double-count the same words).
+  function collectTextChunks(container) {
+    const chunks = [];
+    const skipTags = new Set([
+      "IMG",
+      "SVG",
+      "BUTTON",
+      "STYLE",
+      "SCRIPT",
+      "VIDEO",
+      "AUDIO",
+      "CANVAS",
+      "INPUT",
+      "TEXTAREA",
+    ]);
+    const walker = document.createTreeWalker(
+      container,
+      NodeFilter.SHOW_ELEMENT,
+      {
+        acceptNode(el) {
+          if (skipTags.has(el.tagName)) return NodeFilter.FILTER_REJECT;
+          if (el.getAttribute && el.getAttribute("aria-hidden") === "true") {
+            return NodeFilter.FILTER_REJECT;
+          }
+          const role = el.getAttribute && el.getAttribute("role");
+          if (role === "img" || role === "presentation") {
+            return NodeFilter.FILTER_REJECT;
+          }
+          return NodeFilter.FILTER_ACCEPT;
+        },
+      }
+    );
+
+    let el;
+    while ((el = walker.nextNode())) {
+      // Only keep text leaves: elements whose direct text nodes have
+      // content, and whose element children (if any) don't themselves carry
+      // non-trivial text. This gives us one chunk per rendered text span.
+      const ownText = getDirectText(el);
+      if (!ownText) continue;
+
+      const hasTextChildren = hasAnyChildElementWithText(el);
+      if (hasTextChildren) continue;
+
+      chunks.push({ text: ownText, el });
+    }
+    return chunks;
+  }
+
+  // Return the concatenation of the element's direct text-node children,
+  // trimmed and whitespace-collapsed. Excludes text from element children.
+  function getDirectText(el) {
+    let s = "";
+    for (const node of el.childNodes) {
+      if (node.nodeType === Node.TEXT_NODE) {
+        s += node.nodeValue || "";
+      }
+    }
+    return s.replace(/\s+/g, " ").trim();
+  }
+
+  // True if any child element has meaningful text content of its own. Used to
+  // decide whether an element is a "text leaf" worth capturing as a chunk.
+  function hasAnyChildElementWithText(el) {
+    for (const child of el.children) {
+      if (!child) continue;
+      if (child.tagName === "IMG" || child.tagName === "SVG") continue;
+      const t = (child.textContent || "").trim();
+      if (t.length > 0) return true;
+    }
+    return false;
   }
 
   // Pull speaker / timestamp / text from a single transcript row element.
@@ -426,7 +775,7 @@
     const cleanedText = cleanText(turn.text, turn.speaker);
     return {
       speaker: cleanSpeakerName(turn.speaker),
-      timestamp: turn.timestamp || "",
+      timestamp: normalizeTimestamp(turn.timestamp || ""),
       text: cleanedText,
     };
   }
