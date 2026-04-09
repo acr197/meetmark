@@ -30,26 +30,78 @@
   // grew. If it didn't, we proceed with what we have.
   const SETTLE_DELAY_MS = 800;
 
-  // Listen for the "export" message from the popup. This is the only entry
-  // point into the script. We respond asynchronously, so we return true.
-  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-    if (!message || message.type !== "MEETMARK_EXPORT") {
-      return false;
-    }
-    runExport()
-      .then((result) => sendResponse(result))
-      .catch((err) => {
-        sendResponse({
-          ok: false,
-          error: (err && err.message) || String(err),
+  // Listen for port connections from the popup. The popup opens a long-lived
+  // Port named "meetmark", sends { type: "start" } to begin, and listens for
+  // { type: "progress" / "done" / "error" } messages back. It may also send
+  // { type: "cancel" } at any time.
+  chrome.runtime.onConnect.addListener((port) => {
+    if (port.name !== "meetmark") return;
+
+    let cancelled = false;
+
+    port.onDisconnect.addListener(() => {
+      cancelled = true;
+    });
+
+    port.onMessage.addListener((msg) => {
+      if (!msg) return;
+      if (msg.type === "cancel") {
+        cancelled = true;
+        return;
+      }
+      if (msg.type !== "start") return;
+
+      function isCancelled() {
+        return cancelled;
+      }
+
+      runExport(port, isCancelled)
+        .then((result) => {
+          if (cancelled) return;
+          if (result.ok) {
+            try {
+              port.postMessage({
+                type: "done",
+                filename: result.filename,
+                markdown: result.markdown,
+                warning: result.warning || null,
+                turnCount: result.turnCount || 0,
+                speakerCount: result.speakerCount || 0,
+              });
+            } catch (_) {}
+          } else {
+            try {
+              port.postMessage({
+                type: "error",
+                message: result.error || "Export failed.",
+              });
+            } catch (_) {}
+          }
+        })
+        .catch((err) => {
+          if (cancelled) return;
+          try {
+            port.postMessage({
+              type: "error",
+              message: (err && err.message) || String(err),
+            });
+          } catch (_) {}
         });
-      });
-    return true;
+    });
   });
 
-  // Top-level orchestration. Returns { ok, markdown, filename, warning } or
-  // { ok: false, error }.
-  async function runExport() {
+  // Top-level orchestration. Returns { ok, markdown, filename, warning,
+  // turnCount, speakerCount } or { ok: false, error }.
+  async function runExport(port, isCancelled) {
+    function progress(message, detail) {
+      if (!port) return;
+      try {
+        port.postMessage({ type: "progress", message, detail: detail || "" });
+      } catch (_) {}
+    }
+
+    progress("Locating transcript panel...");
+
     // If the transcript panel isn't open yet, try to click the Transcript
     // button in the Stream player sidebar. On SharePoint Stream the URL does
     // not change when the panel opens, so this is the only hint we have.
@@ -68,18 +120,30 @@
       };
     }
 
+    if (isCancelled && isCancelled()) {
+      return { ok: false, error: "Cancelled." };
+    }
+
+    progress("Reading transcript...");
+
     // Collect turns while scrolling. Stream uses a virtualized list, so rows
     // outside the viewport are removed from the DOM; we must scrape at every
     // scroll step and dedupe, not just scrape once at the end.
     let collectResult;
     try {
-      collectResult = await scrollAndCollectTurns(container);
+      collectResult = await scrollAndCollectTurns(container, port, isCancelled);
     } catch (err) {
       return {
         ok: false,
         error: "Scroll/scrape error: " + ((err && err.message) || String(err)),
       };
     }
+
+    if (isCancelled && isCancelled()) {
+      return { ok: false, error: "Cancelled." };
+    }
+
+    progress("Processing transcript...");
 
     const warning = collectResult.timedOut
       ? "Scroll timed out before all content loaded. Exporting what was collected."
@@ -108,6 +172,8 @@
       markdown,
       filename,
       warning,
+      turnCount: mergedTurns.length,
+      speakerCount: participants.length,
     };
   }
 
@@ -266,7 +332,7 @@
   // way to collect the full transcript.
   //
   // Returns { turns, timedOut }.
-  async function scrollAndCollectTurns(container) {
+  async function scrollAndCollectTurns(container, port, isCancelled) {
     const scroller = findScroller(container);
     const collected = new Map();
     const collectOrder = [];
@@ -304,6 +370,14 @@
     // We deliberately require multiple stable confirmations because Stream's
     // virtualized list grows its scrollHeight as new rows are fetched.
     while (true) {
+      if (isCancelled && isCancelled()) {
+        scroller.scrollTop = 0;
+        return {
+          turns: collectOrder.map((k) => collected.get(k)),
+          timedOut: false,
+        };
+      }
+
       if (Date.now() - startTime > MAX_SCROLL_MS) {
         scroller.scrollTop = 0;
         return {
@@ -324,6 +398,18 @@
 
       const afterScroll = scroller.scrollTop;
       const afterHeight = scroller.scrollHeight;
+
+      // Report scroll progress so the popup can show something is happening.
+      if (port && afterHeight > 0) {
+        const pct = Math.min(100, Math.round((afterScroll / afterHeight) * 100));
+        try {
+          port.postMessage({
+            type: "progress",
+            message: "Reading transcript... " + pct + "%",
+            detail: collectOrder.length + " turns collected",
+          });
+        } catch (_) {}
+      }
       const atBottom =
         afterScroll + scroller.clientHeight >= afterHeight - 4;
 
