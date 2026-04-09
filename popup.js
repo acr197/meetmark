@@ -12,6 +12,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
   let port = null;
   let tabId = null;
+  // Set to true once we receive a terminal "done" or "error" message from
+  // the content script, so the onDisconnect handler can distinguish a
+  // normal teardown from a silent drop (e.g. content script never responded).
+  let receivedTerminal = false;
 
   // Render a message in the popup status area with a severity class.
   function setStatus(message, level) {
@@ -72,6 +76,7 @@ document.addEventListener("DOMContentLoaded", () => {
     setStatus("");
     setDetail("");
     setBusy(true);
+    receivedTerminal = false;
 
     try {
       const [tab] = await chrome.tabs.query({
@@ -108,9 +113,21 @@ document.addEventListener("DOMContentLoaded", () => {
       port = chrome.tabs.connect(tab.id, { name: "meetmark" });
 
       port.onDisconnect.addListener(() => {
-        // If the content script goes away unexpectedly, treat it as an
-        // error only if we never heard a "done" / "error".
+        // If the content script never sent us a "done" or "error" before
+        // the port went away, surface that explicitly instead of leaving
+        // the popup stuck on "Starting export...". The most common cause
+        // is a stale content script from a previous extension build that
+        // still holds the __meetmarkLoaded guard; a tab reload fixes it.
+        const wasOpen = port !== null;
         port = null;
+        if (wasOpen && !receivedTerminal) {
+          setStatus(
+            "Lost connection to the page before the transcript could be read. Reload the Teams/Stream tab and try again.",
+            "error"
+          );
+          setDetail("");
+          setBusy(false);
+        }
       });
 
       port.onMessage.addListener((msg) => {
@@ -124,9 +141,11 @@ document.addEventListener("DOMContentLoaded", () => {
             setStatus(msg.message || "Warning", "warn");
             break;
           case "done":
+            receivedTerminal = true;
             handleDone(msg);
             break;
           case "error":
+            receivedTerminal = true;
             setStatus(msg.message || "Export failed.", "error");
             setDetail("");
             closePort();
