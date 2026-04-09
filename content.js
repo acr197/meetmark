@@ -20,15 +20,26 @@
 
   // Maximum total time we are willing to spend scrolling for lazy content,
   // in milliseconds. Long meetings (2+ hours) can take a while to load.
-  const MAX_SCROLL_MS = 60000;
+  const MAX_SCROLL_MS = 90000;
 
   // Pause between incremental scroll steps. Teams renders virtualized
-  // chunks; too fast and we skip rendering.
-  const SCROLL_STEP_DELAY_MS = 250;
+  // chunks; too fast and we skip rendering. This is the *minimum* we wait
+  // before scraping — if the DOM is still mutating, waitForDomSettle will
+  // extend it adaptively up to STEP_MAX_WAIT_MS.
+  const SCROLL_STEP_DELAY_MS = 200;
+  const STEP_MAX_WAIT_MS = 1500;
+  const STEP_QUIET_MS = 250;
 
   // After we hit the bottom we wait this long and re-check whether the page
-  // grew. If it didn't, we proceed with what we have.
-  const SETTLE_DELAY_MS = 800;
+  // grew. Lazy-loaded Stream transcripts often keep fetching even after the
+  // scrollbar reaches the bottom, so we give them generous time to settle
+  // and watch for DOM mutations before declaring we're done.
+  const SETTLE_MAX_WAIT_MS = 3500;
+  const SETTLE_QUIET_MS = 600;
+
+  // How many consecutive stable bottom confirmations we need before we
+  // declare the transcript fully loaded.
+  const STABLE_BOTTOM_REQUIRED = 3;
 
   // Listen for port connections from the popup. The popup opens a long-lived
   // Port named "meetmark", sends { type: "start" } to begin, and listens for
@@ -161,7 +172,8 @@
     const cleanedTurns = rawTurns
       .map(cleanTurn)
       .filter((t) => t.text.length > 0 || t.speaker.length > 0);
-    const mergedTurns = mergeAdjacentTurns(cleanedTurns);
+    const propagatedTurns = propagateSpeakers(cleanedTurns);
+    const mergedTurns = mergeAdjacentTurns(propagatedTurns);
     const participants = collectParticipants(mergedTurns);
     const metadata = extractMeetingMetadata();
     const markdown = formatMarkdown(mergedTurns, participants, metadata);
@@ -301,6 +313,53 @@
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  // Wait until DOM mutations inside `root` have been quiet for `quietMs`,
+  // or until `maxMs` total has elapsed. Returns true if the DOM went quiet,
+  // false if it timed out while still mutating.
+  //
+  // This is the core of our lazy-load handling: instead of guessing a fixed
+  // sleep duration, we watch the transcript container for row additions /
+  // text changes and only proceed once it stops changing. That way fast
+  // loads finish quickly and slow loads still get all their content.
+  function waitForDomSettle(root, quietMs, maxMs) {
+    return new Promise((resolve) => {
+      if (!root || typeof MutationObserver === "undefined") {
+        setTimeout(() => resolve(true), quietMs);
+        return;
+      }
+      const start = Date.now();
+      let lastChange = Date.now();
+      const observer = new MutationObserver(() => {
+        lastChange = Date.now();
+      });
+      try {
+        observer.observe(root, {
+          childList: true,
+          subtree: true,
+          characterData: true,
+        });
+      } catch (_) {
+        setTimeout(() => resolve(true), quietMs);
+        return;
+      }
+      const tick = () => {
+        const now = Date.now();
+        if (now - lastChange >= quietMs) {
+          observer.disconnect();
+          resolve(true);
+          return;
+        }
+        if (now - start >= maxMs) {
+          observer.disconnect();
+          resolve(false);
+          return;
+        }
+        setTimeout(tick, 60);
+      };
+      setTimeout(tick, Math.min(60, quietMs));
+    });
+  }
+
   // Determine which element actually scrolls. Some surfaces scroll the
   // container itself; others scroll a parent. Walk up until we find one
   // whose scrollHeight exceeds its clientHeight by a meaningful margin.
@@ -356,14 +415,17 @@
     const startTime = Date.now();
 
     // Start at the very top so rows render from the beginning of the meeting.
+    // Give the virtualized list time to rebuild from offset 0 before we
+    // scrape — the initial jump often triggers a fetch of the first chunk.
     scroller.scrollTop = 0;
-    await sleep(SETTLE_DELAY_MS);
+    await waitForDomSettle(container, SETTLE_QUIET_MS, SETTLE_MAX_WAIT_MS);
     scrapeOnce();
 
     let stableAtBottom = 0;
     let stableStuck = 0;
     let lastScrollTop = -1;
     let lastHeight = -1;
+    let lastTurnCount = 0;
 
     // The outer loop drives the scroll downward until we have been at the
     // very bottom, with stable scrollHeight, for several consecutive checks.
@@ -390,10 +452,17 @@
       const beforeHeight = scroller.scrollHeight;
       const viewport = scroller.clientHeight || window.innerHeight || 600;
 
-      // Advance by ~70% of viewport height so there is overlap between scrape
-      // steps and no row gets skipped.
-      scroller.scrollTop = beforeScroll + viewport * 0.7;
+      // Advance by ~60% of viewport height so there is overlap between
+      // scrape steps and no row gets skipped. A smaller step also gives
+      // the virtualized list more chances to finish rendering between
+      // scrapes, which matters for lazy-loaded chunks.
+      scroller.scrollTop = beforeScroll + viewport * 0.6;
+
+      // Minimum pause, then adaptively wait until the DOM has been quiet
+      // for STEP_QUIET_MS (or we hit STEP_MAX_WAIT_MS). This is what keeps
+      // us from scraping mid-fetch while still finishing fast loads quickly.
       await sleep(SCROLL_STEP_DELAY_MS);
+      await waitForDomSettle(container, STEP_QUIET_MS, STEP_MAX_WAIT_MS);
       scrapeOnce();
 
       const afterScroll = scroller.scrollTop;
@@ -415,16 +484,34 @@
 
       if (atBottom) {
         // Wait for any trailing lazy fetches to land, then re-scrape.
-        await sleep(SETTLE_DELAY_MS);
-        scrapeOnce();
-        // Jump to the exact bottom to trigger any "almost there" fetches.
+        // We explicitly jump to the exact bottom to trigger any "almost
+        // there" fetches that a 60% step might miss.
         scroller.scrollTop = scroller.scrollHeight;
-        await sleep(SETTLE_DELAY_MS);
+        const settledA = await waitForDomSettle(
+          container,
+          SETTLE_QUIET_MS,
+          SETTLE_MAX_WAIT_MS
+        );
         scrapeOnce();
 
-        if (scroller.scrollHeight === afterHeight) {
+        // Second pass: bounce scroll slightly to force the virtualized
+        // list to re-check its fetch boundaries, then wait again.
+        scroller.scrollTop = scroller.scrollHeight - 1;
+        scroller.scrollTop = scroller.scrollHeight;
+        const settledB = await waitForDomSettle(
+          container,
+          SETTLE_QUIET_MS,
+          SETTLE_MAX_WAIT_MS
+        );
+        scrapeOnce();
+
+        const heightGrew = scroller.scrollHeight > afterHeight;
+        const turnsGrew = collectOrder.length > lastTurnCount;
+        const quiet = settledA && settledB;
+
+        if (!heightGrew && !turnsGrew && quiet) {
           stableAtBottom += 1;
-          if (stableAtBottom >= 4) {
+          if (stableAtBottom >= STABLE_BOTTOM_REQUIRED) {
             // Truly done. Reset scroll position for the user's convenience.
             scroller.scrollTop = 0;
             return {
@@ -433,8 +520,11 @@
             };
           }
         } else {
+          // Something changed while we were settling — give the list
+          // another round to finish loading before re-evaluating.
           stableAtBottom = 0;
         }
+        lastTurnCount = collectOrder.length;
       } else {
         stableAtBottom = 0;
       }
@@ -942,16 +1032,176 @@
   }
 
   // ---------------------------------------------------------------------------
+  // Speaker propagation
+  // ---------------------------------------------------------------------------
+
+  // Teams / Stream transcripts are often rendered one paragraph per row.
+  // The first row in a speaker's block carries the name + timestamp, and
+  // subsequent rows carry only body text with no speaker attribution. If we
+  // don't fix this up, every continuation row gets labeled "Unknown speaker"
+  // in the final markdown.
+  //
+  // This function walks the cleaned turn list in order, tracks the most
+  // recently seen speaker, and assigns it to body-only rows until a new
+  // speaker header appears. It also:
+  //   - drops header-only rows (speaker set but empty text) after their
+  //     speaker has been propagated to the following body rows
+  //   - detects embedded "Name 0:03 ..." prefixes when the scraper fused
+  //     the header into the body text
+  //   - tags meta lines like "Rachel Piot started transcription" with
+  //     isSystem so the formatter can render them without a speaker header
+  function propagateSpeakers(turns) {
+    const result = [];
+    let currentSpeaker = "";
+    let currentTimestamp = "";
+
+    const metaRe =
+      /^([^.\d\n]{2,80}?)\s+(started transcription|stopped transcription|started recording|stopped recording|joined the meeting|left the meeting)\.?$/i;
+
+    for (const turn of turns) {
+      const rawText = (turn.text || "").trim();
+      const rawSpeaker = (turn.speaker || "").trim();
+      const rawTimestamp = (turn.timestamp || "").trim();
+
+      // Meta / system line. These are things like "Rachel Piot started
+      // transcription" that Teams injects above the first real utterance.
+      // We preserve them but mark them so the formatter doesn't bold them
+      // like a speaker turn.
+      if (!rawSpeaker && metaRe.test(rawText)) {
+        result.push({
+          speaker: "",
+          timestamp: rawTimestamp,
+          text: rawText,
+          isSystem: true,
+        });
+        continue;
+      }
+
+      // Row has an explicit speaker. Update current-speaker state. If the
+      // row also carries body text, push a normal turn — stripping any
+      // duplicated "Name 0:03" prefix that may have been fused in from the
+      // header when the DOM had no internal boundaries.
+      if (rawSpeaker) {
+        currentSpeaker = rawSpeaker;
+        if (rawTimestamp) currentTimestamp = rawTimestamp;
+        if (rawText) {
+          const stripped = stripLeadingHeader(rawText, rawSpeaker);
+          if (stripped) {
+            result.push({
+              speaker: currentSpeaker,
+              timestamp: rawTimestamp || currentTimestamp,
+              text: stripped,
+            });
+          }
+        }
+        continue;
+      }
+
+      // No speaker on this row. First, see if the body text itself begins
+      // with a "Name 0:03 ..." header — that happens when a virtualized
+      // row flattens the header and body into one text node.
+      const embedded = rawText.match(
+        /^([A-Za-z][\p{L}\s'\-.]{0,78}?)\s+(\d{1,3}:\d{2}(?::\d{2})?)(?:\s+([\s\S]+))?$/u
+      );
+      if (embedded && looksLikeName(embedded[1])) {
+        currentSpeaker = embedded[1].trim();
+        currentTimestamp = embedded[2];
+        const body = (embedded[3] || "").trim();
+        if (body) {
+          result.push({
+            speaker: currentSpeaker,
+            timestamp: currentTimestamp,
+            text: body,
+          });
+        }
+        continue;
+      }
+
+      // Row whose entire content is a bare "First Last" style name, with
+      // no timestamp in the same text node (the timestamp may have been
+      // filtered out by extractText via aria-hidden / role="presentation"
+      // markup, or it may live in a separate row). Treat as a header-only
+      // speaker change so we don't silently inherit this text as the
+      // previous speaker's continuation.
+      if (looksLikeBareName(rawText)) {
+        currentSpeaker = rawText;
+        if (rawTimestamp) currentTimestamp = rawTimestamp;
+        continue;
+      }
+
+      // Otherwise this is a pure continuation row. Inherit whatever speaker
+      // we last saw. If we haven't seen any speaker yet, fall back to
+      // "Unknown speaker" at format time by leaving it blank.
+      if (rawText) {
+        result.push({
+          speaker: currentSpeaker,
+          timestamp: currentTimestamp,
+          text: rawText,
+        });
+      }
+    }
+    return result;
+  }
+
+  // Stricter than looksLikeName: match only strings that plausibly are a
+  // full personal name on their own, e.g. "Jacqueline Derron" or "Dr. Smith".
+  // Requires 2-5 titlecase words, no digits, and no sentence punctuation.
+  function looksLikeBareName(s) {
+    if (!s) return false;
+    const trimmed = s.trim();
+    if (trimmed.length < 3 || trimmed.length > 60) return false;
+    if (/\d/.test(trimmed)) return false;
+    // Disallow sentence / clause punctuation.
+    if (/[,!?;:]/.test(trimmed)) return false;
+    const words = trimmed.split(/\s+/);
+    if (words.length < 2 || words.length > 5) return false;
+    for (const w of words) {
+      if (!/^[A-Z]/.test(w)) return false;
+    }
+    return true;
+  }
+
+  // Strip a "Name [TIME]" prefix from the start of a text fragment when
+  // that prefix duplicates the row's own speaker. Used to clean up rows
+  // where the scraper got both the header and the body text from a single
+  // fused text node.
+  function stripLeadingHeader(text, speaker) {
+    if (!text || !speaker) return text;
+    const escaped = escapeRegExp(speaker);
+    const re = new RegExp(
+      "^\\s*" + escaped + "\\s*(?:\\d{1,3}:\\d{2}(?::\\d{2})?)?\\s*",
+      "i"
+    );
+    return text.replace(re, "").trim();
+  }
+
+  // ---------------------------------------------------------------------------
   // Merging
   // ---------------------------------------------------------------------------
 
   // Merge consecutive rows from the same speaker into a single block. The
   // first timestamp wins; subsequent text is appended as additional sentences.
+  // System meta rows (isSystem: true) are never merged with regular turns
+  // and never merge with each other — they stand on their own.
   function mergeAdjacentTurns(turns) {
     const merged = [];
     for (const turn of turns) {
+      if (turn.isSystem) {
+        merged.push({
+          speaker: turn.speaker || "",
+          timestamp: turn.timestamp || "",
+          text: turn.text,
+          isSystem: true,
+        });
+        continue;
+      }
       const last = merged[merged.length - 1];
-      if (last && last.speaker && last.speaker === turn.speaker) {
+      if (
+        last &&
+        !last.isSystem &&
+        last.speaker &&
+        last.speaker === turn.speaker
+      ) {
         if (turn.text) {
           last.text = (last.text + " " + turn.text).replace(/\s+/g, " ").trim();
         }
@@ -1095,6 +1345,16 @@
 
   // Render the final Markdown document. Two trailing spaces after each header
   // line force Markdown line breaks.
+  //
+  // Transcript body layout:
+  //   - System/meta lines like "X started transcription" render as plain
+  //     italic text with no bold speaker header.
+  //   - Regular turns render as a bold speaker name followed by the full
+  //     merged utterance. Consecutive turns from the same speaker share one
+  //     header and are never re-labeled. mergeAdjacentTurns handles the
+  //     actual text joining upstream; the guard here is just defensive.
+  //   - Timestamps are not printed inline in the body — the user's desired
+  //     output format omits them.
   function formatMarkdown(turns, participants, metadata) {
     const exportStamp = nowLocalStamp();
     const meetingDateIso = formatDateIso(metadata.date);
@@ -1120,12 +1380,25 @@
     lines.push("## Transcript");
     lines.push("");
 
+    let lastSpeaker = null;
     for (const turn of turns) {
+      if (turn.isSystem) {
+        lines.push("_" + turn.text + "_");
+        lines.push("");
+        lastSpeaker = null;
+        continue;
+      }
+
       const speakerLabel = turn.speaker || "Unknown speaker";
-      const stamp = turn.timestamp ? " `" + turn.timestamp + "`" : "";
-      lines.push("**" + speakerLabel + "**" + stamp);
-      lines.push(turn.text);
-      lines.push("");
+      if (speakerLabel !== lastSpeaker) {
+        lines.push("**" + speakerLabel + "**");
+        lines.push("");
+        lastSpeaker = speakerLabel;
+      }
+      if (turn.text) {
+        lines.push(turn.text);
+        lines.push("");
+      }
     }
 
     lines.push("---");
