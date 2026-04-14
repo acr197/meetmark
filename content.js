@@ -23,8 +23,10 @@
   const MAX_SCROLL_MS = 60000;
 
   // Pause between incremental scroll steps. Teams renders virtualized
-  // chunks; too fast and we skip rendering.
-  const SCROLL_STEP_DELAY_MS = 250;
+  // chunks; too fast and we skip rendering of newly-injected rows, causing
+  // the lazy-load mechanism to reset. 500 ms gives each batch of DOM nodes
+  // time to settle before the next scroll fires.
+  const SCROLL_STEP_DELAY_MS = 500;
 
   // After we hit the bottom we wait this long and re-check whether the page
   // grew. If it didn't, we proceed with what we have.
@@ -220,29 +222,119 @@
   // tenants serve Teams meeting recordings and their transcripts.
   function findTranscriptContainer() {
     const containerSelectors = [
-      // SharePoint Stream (stream.aspx) transcript panel.
+      // SharePoint Stream (stream.aspx) — known stable data-automationid hooks.
       '[data-automationid="transcript-virtualized-list"]',
       '[data-automationid="transcriptList"]',
       '[data-automationid="transcript-list"]',
       '[data-automationid="transcript-panel"] [role="list"]',
       '[data-automationid="transcript-panel"]',
-      'div[aria-label="Transcript"] [role="list"]',
-      'div[aria-label="Transcript"]',
-      // Teams native surfaces.
+
+      // Teams web recording-playback sidebar (teams.microsoft.com).
+      // The sidebar panels use data-tid identifiers and Fluent UI roles.
+      '[data-tid="calling-transcript-list"]',
+      '[data-tid="calling-transcript"]',
+      '[data-tid="recording-transcript-list"]',
+      '[data-tid="recording-transcript-panel"]',
+      '[data-tid="recording-transcript"]',
+      '[data-tid="transcript-content"]',
       '[data-tid="transcript-list"]',
       '[data-tid="transcriptList"]',
       '[data-tid="closed-caption-renderer"]',
-      'div[role="list"][aria-label*="ranscript" i]',
+
+      // Role + aria-label combos (language-independent case-insensitive).
+      '[role="list"][aria-label*="ranscript" i]',
+      '[role="feed"][aria-label*="ranscript" i]',
+      '[role="log"][aria-label*="ranscript" i]',
+      '[role="region"][aria-label*="ranscript" i]',
+      '[role="tabpanel"][aria-label*="ranscript" i]',
       'div[aria-label*="ranscript" i]',
-      ".ts-transcript",
+      'section[aria-label*="ranscript" i]',
+      'div[aria-label="Transcript"] [role="list"]',
+      'div[aria-label="Transcript"]',
+
+      // Broad class-name patterns Teams components often share.
+      '[class*="calling-transcript"]',
+      '[class*="meeting-transcript"]',
+      '[class*="transcript-panel"]',
+      '[class*="transcript-list"]',
+      '[class*="ts-transcript"]',
       ".transcript-list",
       ".transcript",
+
+      // Tab-panel containers — Teams recording sidebar wraps content in a
+      // tabpanel element whose child list has the actual items.
+      '[role="tabpanel"] [role="list"]',
+      '[role="tabpanel"] [role="feed"]',
+      '[role="tabpanel"]',
     ];
-    return querySelectorWithFallbacks(
+
+    const found = querySelectorWithFallbacks(
       document,
       containerSelectors,
       "transcript container"
     );
+    if (found) return found;
+
+    // Last-resort heuristic: the transcript container is the deepest DOM
+    // element that contains at least three timestamp-like strings (e.g.
+    // "0:03", "7:24"). Transcript panels are uniquely timestamp-dense;
+    // no other sidebar panel looks like this.
+    return findContainerByTimestampDensity();
+  }
+
+  // Walk visible block-level elements and return the deepest one that
+  // contains at least MIN_STAMPS distinct timestamp strings. "Deepest" means
+  // highest ancestor-count, which gives us the most-specific container.
+  function findContainerByTimestampDensity() {
+    const MIN_STAMPS = 3;
+    const TIME_PAT = /\b\d{1,3}:\d{2}\b/g;
+    const seen = new Set();
+    const candidates = document.querySelectorAll(
+      [
+        "div", "section", "aside", "main", "ul", "ol",
+        '[role="list"]', '[role="feed"]', '[role="log"]',
+        '[role="region"]', '[role="tabpanel"]',
+      ].join(",")
+    );
+
+    let best = null;
+    let bestDepth = -1;
+
+    for (const el of candidates) {
+      if (el === document.body || el === document.documentElement) continue;
+      if (seen.has(el)) continue;
+      seen.add(el);
+
+      // Skip elements that are hidden or zero-size.
+      if (!el.offsetParent && el.tagName !== "BODY") {
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 && rect.height === 0) continue;
+      }
+
+      const text = el.innerText || el.textContent || "";
+      const stamps = text.match(TIME_PAT);
+      if (!stamps || stamps.length < MIN_STAMPS) continue;
+
+      // Count ancestor depth.
+      let depth = 0;
+      let node = el;
+      while (node.parentElement) {
+        depth++;
+        node = node.parentElement;
+      }
+
+      if (depth > bestDepth) {
+        best = el;
+        bestDepth = depth;
+      }
+    }
+
+    if (best) {
+      console.log(
+        "[MeetMark] transcript container found by timestamp density heuristic"
+      );
+    }
+    return best;
   }
 
   // ---------------------------------------------------------------------------
@@ -571,23 +663,19 @@
   // that yields nothing we fall back to the class/attribute-driven scraper
   // which works for native Teams surfaces.
   function scrapeTurns(container) {
-    const host = (location.hostname || "").toLowerCase();
-    const isSharePoint = host.endsWith(".sharepoint.com");
+    // The pattern scraper walks text-leaf DOM elements in document order and
+    // groups them by the Name → HH:MM → Text cadence that every Teams/Stream
+    // transcript follows, regardless of class or attribute naming. Running it
+    // first on every surface avoids the selector scraper's blind spot: it
+    // matches continuation listitem rows (which carry text but no speaker
+    // element) and emits them as speakerless "Unknown speaker" fragments.
+    const patternTurns = scrapeTurnsByPattern(container);
+    if (patternTurns.length > 0) return patternTurns;
 
-    if (isSharePoint) {
-      // SharePoint Stream: use only the pattern scraper. The selector scraper
-      // on this surface picks up generic listitem continuation rows (utterance
-      // fragments that don't carry a speaker element) and emits them as
-      // speakerless turns, which then render as "Unknown speaker" blocks.
-      return scrapeTurnsByPattern(container);
-    }
-
-    const selectorTurns = scrapeTurnsBySelector(container);
-    if (selectorTurns.length > 0) return selectorTurns;
-
-    // Last resort on Teams native: pattern scraper. Slower but doesn't need
-    // class names.
-    return scrapeTurnsByPattern(container);
+    // Fallback to the selector scraper for surfaces where the pattern scraper
+    // produces nothing (e.g. closed-captions panels with known data-tid hooks
+    // and very short visible windows that don't expose the name+time header).
+    return scrapeTurnsBySelector(container);
   }
 
   // The original selector/attribute-driven scraper. Good for Teams native
