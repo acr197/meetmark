@@ -1,6 +1,8 @@
 # MeetMark
 Chrome extension that converts Microsoft Teams meeting transcripts to clean Markdown files ready for Custom GPT ingestion for AI training.
 
+[30s Demo](https://youtu.be/ZLr_SPXFyQY) (Sensitive data censored) 
+
 ## What It Does
 Opens directly on any Teams recording page in SharePoint Stream. Scrapes the transcript panel, groups speech by speaker, and exports a structured Markdown file with metadata, speaker blocks, and full dialogue. Output is formatted for use with custom GPTs, RAG pipelines, or any LLM that ingests documents.
 
