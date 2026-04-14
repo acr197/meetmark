@@ -670,7 +670,10 @@
     // matches continuation listitem rows (which carry text but no speaker
     // element) and emits them as speakerless "Unknown speaker" fragments.
     const patternTurns = scrapeTurnsByPattern(container);
-    if (patternTurns.length > 0) return patternTurns;
+    // Only trust the pattern scraper if it actually recognised at least one
+    // speaker. Without that anchor its chunks would be indistinguishable from
+    // surrounding UI chrome, and the selector scraper is a safer fallback.
+    if (patternTurns.some((t) => t.speaker)) return patternTurns;
 
     // Fallback to the selector scraper for surfaces where the pattern scraper
     // produces nothing (e.g. closed-captions panels with known data-tid hooks
@@ -722,110 +725,166 @@
     return groupChunksIntoTurns(chunks);
   }
 
-  // Pattern that matches a bare timestamp like "7:24", "12:05", or
-  // "1:02:35". Used to identify header rows in the text-chunk stream.
-  const TIME_ONLY_RE = /^\s*\d{1,3}:\d{2}(?::\d{2})?\s*$/;
-  const TIME_ANYWHERE_RE = /\d{1,3}:\d{2}(?::\d{2})?/;
+  // Pattern that matches a bare digital timestamp like "7:24", "12:05", or
+  // "1:02:35".
+  const DIGITAL_TIME_RE = /\d{1,3}:\d{2}(?::\d{2})?/;
 
-  // A single-chunk header like "Jacqueline Derron 7:24" where the speaker
-  // name is followed by a timestamp (and nothing else).
-  const NAME_AND_TIME_RE =
-    /^(.{1,80}?)\s+(\d{1,3}:\d{2}(?::\d{2})?)\s*$/;
+  // Readable timestamp produced by Teams for accessibility, e.g.
+  // "0 minutes 3 seconds" or "1 hour 20 minutes 3 seconds".
+  const READABLE_TIME_RE =
+    /(?:\d+\s*hours?\s+)?\d+\s*minutes?\s+\d+\s*seconds?/i;
 
-  // "Name 7:24 Text..." — everything packed into one chunk.
-  const NAME_TIME_TEXT_RE =
-    /^(.{1,80}?)\s+(\d{1,3}:\d{2}(?::\d{2})?)\s+([\s\S]+)$/;
+  // A chunk consisting solely of a timestamp in digital form, readable form,
+  // or the two concatenated together (e.g. "0 minutes 3 seconds0:03").
+  const TIMESTAMP_ONLY_RE = new RegExp(
+    "^\\s*(?:" +
+      "\\d{1,3}:\\d{2}(?::\\d{2})?" +
+      "|" +
+      "(?:\\d+\\s*hours?\\s+)?\\d+\\s*minutes?\\s+\\d+\\s*seconds?" +
+      "|" +
+      "\\d{1,3}:\\d{2}(?::\\d{2})?\\s*(?:\\d+\\s*hours?\\s+)?\\d+\\s*minutes?\\s+\\d+\\s*seconds?" +
+      "|" +
+      "(?:\\d+\\s*hours?\\s+)?\\d+\\s*minutes?\\s+\\d+\\s*seconds?\\s*\\d{1,3}:\\d{2}(?::\\d{2})?" +
+      ")\\s*$",
+    "i"
+  );
 
-  // Decide whether a string looks like a speaker name candidate: short-ish,
-  // no timestamp, no sentence punctuation at the end.
-  function looksLikeName(s) {
+  // A "Name TIME ..." trailing-timestamp header. The timestamp may be digital,
+  // readable, or both concatenated/adjacent.
+  const NAME_PLUS_TIME_RE = new RegExp(
+    "^(.{1,80}?)\\s+(" +
+      "(?:\\d+\\s*hours?\\s+)?\\d+\\s*minutes?\\s+\\d+\\s*seconds?\\s*(?:\\d{1,3}:\\d{2}(?::\\d{2})?)?" +
+      "|" +
+      "\\d{1,3}:\\d{2}(?::\\d{2})?\\s*(?:(?:\\d+\\s*hours?\\s+)?\\d+\\s*minutes?\\s+\\d+\\s*seconds?)?" +
+      ")\\s*(.*)$",
+    "i"
+  );
+
+  // System notices Teams inserts into the transcript ("Jacqueline Derron
+  // started transcription", "Recording started", etc.). We drop these.
+  const SYSTEM_BANNER_RE =
+    /^(?:.{1,80}?\s+)?(started|stopped|paused|resumed|joined|left)\s+(transcription|the\s+meeting|the\s+call|recording|captions?)\.?\s*$/i;
+  const SYSTEM_BANNER_LEADING_RE =
+    /^(transcription|recording|captions?)\s+(started|stopped|paused|resumed)\.?\s*$/i;
+
+  // Strict "looks like a person's name" check used when a chunk stands alone
+  // without a timestamp next to it. Requires each word to be capitalized and
+  // forbids sentence punctuation or digits, so it won't swallow utterance
+  // fragments like "Yeah" or "The timing on.".
+  function isStrictName(s) {
     if (!s) return false;
     const trimmed = s.trim();
-    if (trimmed.length < 2 || trimmed.length > 80) return false;
-    if (TIME_ANYWHERE_RE.test(trimmed)) return false;
-    // Sentences usually end with a period / question mark / exclamation.
-    if (/[.!?]$/.test(trimmed) && trimmed.length > 30) return false;
+    if (trimmed.length < 2 || trimmed.length > 60) return false;
+    if (/\d/.test(trimmed)) return false;
+    if (/[.!?,;:]/.test(trimmed)) return false;
+    const words = trimmed.split(/\s+/);
+    if (words.length < 1 || words.length > 5) return false;
+    for (const w of words) {
+      if (!/^[A-Z][A-Za-z'\u2019\-]*\.?$/.test(w)) return false;
+    }
     return true;
   }
 
-  // Try to interpret the chunks at position i as the start of a new turn.
-  // Returns { turn, consumed, hasInlineText } or null.
-  function parseHeaderAt(chunks, i) {
-    const c1 = chunks[i];
-    if (!c1) return null;
+  function isSystemBanner(text) {
+    const t = text.trim();
+    return SYSTEM_BANNER_RE.test(t) || SYSTEM_BANNER_LEADING_RE.test(t);
+  }
 
-    // Case A: "Name TIME Text..." all in one chunk.
-    const m3 = c1.text.match(NAME_TIME_TEXT_RE);
-    if (m3 && looksLikeName(m3[1])) {
-      return {
-        turn: {
-          speaker: m3[1].trim(),
-          timestamp: m3[2],
-          text: m3[3].trim(),
-        },
-        consumed: 1,
-        hasInlineText: true,
-      };
+  function isTimestampChunk(text) {
+    return TIMESTAMP_ONLY_RE.test(text.trim());
+  }
+
+  // Pull a digital timestamp (MM:SS / HH:MM:SS) out of a chunk. If only a
+  // readable form is present ("0 minutes 3 seconds") convert it. Returns ""
+  // if nothing timestamp-like is present.
+  function extractTimestampFromChunk(text) {
+    const digital = text.match(DIGITAL_TIME_RE);
+    if (digital) return digital[0];
+
+    const readable = text.match(
+      /(?:(\d+)\s*hours?\s+)?(\d+)\s*minutes?\s+(\d+)\s*seconds?/i
+    );
+    if (readable) {
+      const h = readable[1] ? parseInt(readable[1], 10) : 0;
+      const mm = parseInt(readable[2], 10);
+      const ss = parseInt(readable[3], 10);
+      const pad = (n) => String(n).padStart(2, "0");
+      if (h > 0) return pad(h) + ":" + pad(mm) + ":" + pad(ss);
+      return pad(mm) + ":" + pad(ss);
+    }
+    return "";
+  }
+
+  // Try to read a speaker-header chunk. Returns { speaker, timestamp,
+  // inlineText } or null. Handles:
+  //   - "Name"                                     (bare name, no time)
+  //   - "Name 7:24"                                 (digital trailing time)
+  //   - "Name 0 minutes 3 seconds"                  (readable trailing time)
+  //   - "Name 0 minutes 3 seconds0:03"              (both concatenated)
+  //   - "Name 7:24 Text..."                         (time + inline utterance)
+  function parseSpeakerHeader(text) {
+    const t = text.trim();
+    if (!t) return null;
+
+    const m = t.match(NAME_PLUS_TIME_RE);
+    if (m && isStrictName(m[1])) {
+      const speaker = m[1].trim();
+      const timestamp = extractTimestampFromChunk(m[2] || "");
+      const inlineText = (m[3] || "").trim();
+      return { speaker, timestamp, inlineText };
     }
 
-    // Case B: "Name TIME" alone in one chunk.
-    const m2 = c1.text.match(NAME_AND_TIME_RE);
-    if (m2 && looksLikeName(m2[1])) {
-      return {
-        turn: {
-          speaker: m2[1].trim(),
-          timestamp: m2[2],
-          text: "",
-        },
-        consumed: 1,
-        hasInlineText: false,
-      };
-    }
-
-    // Case C: "Name" and "TIME" in two consecutive chunks.
-    const c2 = chunks[i + 1];
-    if (c2 && TIME_ONLY_RE.test(c2.text) && looksLikeName(c1.text)) {
-      return {
-        turn: {
-          speaker: c1.text.trim(),
-          timestamp: c2.text.trim(),
-          text: "",
-        },
-        consumed: 2,
-        hasInlineText: false,
-      };
+    if (isStrictName(t)) {
+      return { speaker: t, timestamp: "", inlineText: "" };
     }
 
     return null;
   }
 
-  // Iterate through the chunk stream, identifying header boundaries and
-  // grouping the text chunks between them into a single utterance per turn.
+  // Walk the chunk stream in document order, track the currently-speaking
+  // person, and emit one turn per utterance chunk. Speaker headers (name
+  // alone, or name+timestamp) update the current speaker but don't produce
+  // a turn by themselves. Standalone timestamps attach to the next
+  // utterance. System banners ("X started transcription") are dropped.
   function groupChunksIntoTurns(chunks) {
     const turns = [];
-    let i = 0;
-    while (i < chunks.length) {
-      const header = parseHeaderAt(chunks, i);
-      if (!header) {
-        i += 1;
+    let currentSpeaker = "";
+    let pendingTimestamp = "";
+
+    for (let i = 0; i < chunks.length; i++) {
+      const text = (chunks[i].text || "").trim();
+      if (!text) continue;
+      if (isSystemBanner(text)) continue;
+
+      const header = parseSpeakerHeader(text);
+      if (header) {
+        currentSpeaker = header.speaker;
+        if (header.timestamp) pendingTimestamp = header.timestamp;
+        if (header.inlineText) {
+          turns.push({
+            speaker: currentSpeaker,
+            timestamp: pendingTimestamp,
+            text: header.inlineText,
+          });
+          pendingTimestamp = "";
+        }
         continue;
       }
 
-      i += header.consumed;
-      const turn = header.turn;
-
-      if (!header.hasInlineText) {
-        const textParts = [];
-        while (i < chunks.length) {
-          if (parseHeaderAt(chunks, i)) break;
-          textParts.push(chunks[i].text);
-          i += 1;
-        }
-        turn.text = textParts.join(" ").replace(/\s+/g, " ").trim();
+      if (isTimestampChunk(text)) {
+        const ts = extractTimestampFromChunk(text);
+        if (ts) pendingTimestamp = ts;
+        continue;
       }
 
-      turns.push(turn);
+      turns.push({
+        speaker: currentSpeaker,
+        timestamp: pendingTimestamp,
+        text,
+      });
+      pendingTimestamp = "";
     }
+
     return turns;
   }
 
@@ -1133,59 +1192,41 @@
   // Merging
   // ---------------------------------------------------------------------------
 
-  // Merge consecutive rows from the same speaker into a single block. The
-  // first timestamp wins; subsequent text is appended as additional sentences.
+  // Attribute orphan (speakerless) utterances to the most recent known
+  // speaker, but keep each utterance as its own turn so the final Markdown
+  // renders one utterance per line under each speaker heading instead of
+  // collapsing a whole speaker block into one paragraph.
+  //
+  // Leading speakerless turns (before any speaker has been identified) are
+  // dropped as noise when at least one speakered turn exists. If the scraper
+  // never identified any speaker, every turn is preserved as-is so we still
+  // emit the spoken content.
   function mergeAdjacentTurns(turns) {
-    // If at least one turn has a speaker, treat speakerless turns as
-    // continuations: attach their text to the preceding speaker's block,
-    // or drop them if they're leading noise that appears before any
-    // speakered turn (system banners, "AI-generated content" notices, etc.).
-    // If NO turn has a speaker at all (scraper couldn't identify any), keep
-    // every turn as-is so we preserve the spoken content rather than emitting
-    // an empty transcript.
     const hasAnySpeaker = turns.some((t) => t.speaker);
 
-    const merged = [];
+    const out = [];
+    let lastSpeaker = "";
     for (const turn of turns) {
-      const last = merged[merged.length - 1];
+      if (!turn.text) continue;
 
-      if (hasAnySpeaker && !turn.speaker) {
-        // Continuation of the previous speaker's block (or leading noise if
-        // there is no previous block yet).
-        if (last && last.speaker && turn.text) {
-          last.text = (last.text + " " + turn.text)
-            .replace(/\s+/g, " ")
-            .trim();
-          if (!last.timestamp && turn.timestamp) {
-            last.timestamp = turn.timestamp;
-          }
+      let speaker = turn.speaker;
+      if (!speaker && hasAnySpeaker) {
+        if (!lastSpeaker) {
+          // Noise before the first identified speaker — drop.
+          continue;
         }
-        continue;
+        speaker = lastSpeaker;
       }
 
-      if (
-        last &&
-        last.speaker &&
-        turn.speaker &&
-        last.speaker === turn.speaker
-      ) {
-        if (turn.text) {
-          last.text = (last.text + " " + turn.text)
-            .replace(/\s+/g, " ")
-            .trim();
-        }
-        if (!last.timestamp && turn.timestamp) {
-          last.timestamp = turn.timestamp;
-        }
-      } else {
-        merged.push({
-          speaker: turn.speaker,
-          timestamp: turn.timestamp,
-          text: turn.text,
-        });
-      }
+      out.push({
+        speaker: speaker || "",
+        timestamp: turn.timestamp || "",
+        text: turn.text,
+      });
+
+      if (turn.speaker) lastSpeaker = turn.speaker;
     }
-    return merged;
+    return out;
   }
 
   // Build an alphabetical list of unique speaker names appearing in the
@@ -1335,13 +1376,26 @@
     lines.push("## Transcript");
     lines.push("");
 
+    // Emit one utterance per line, grouped under the speaker's name. The
+    // speaker header is only printed when the speaker changes, so a run of
+    // utterances from the same person appears as consecutive lines beneath a
+    // single name. A blank line separates each speaker group.
+    let prevSpeaker = null;
     for (const turn of turns) {
-      const speakerLabel = turn.speaker || "Unknown speaker";
-      const stamp = turn.timestamp ? " `" + turn.timestamp + "`" : "";
-      lines.push("**" + speakerLabel + "**" + stamp);
+      if (!turn.text) continue;
+      const speakerLabel = turn.speaker || "";
+      if (speakerLabel !== prevSpeaker) {
+        if (prevSpeaker !== null) {
+          lines.push("");
+        }
+        if (speakerLabel) {
+          lines.push(speakerLabel);
+        }
+        prevSpeaker = speakerLabel;
+      }
       lines.push(turn.text);
-      lines.push("");
     }
+    lines.push("");
 
     lines.push("---");
     lines.push("*Exported by MeetMark on " + exportStamp + "*");
