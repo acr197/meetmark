@@ -302,15 +302,18 @@
   }
 
   // Determine which element actually scrolls the transcript panel. Walk up
-  // from the container looking for the nearest ancestor that has an explicit
-  // overflow-y style and scrollable content. Preferring an element with an
-  // explicit overflow style avoids accidentally selecting the page-level
-  // scroller (document.scrollingElement), which Teams/Stream may reset
-  // whenever it renders new content into the page.
+  // from the container looking first for an ancestor that declares an
+  // explicit overflow-y style (auto/scroll/overlay) — these are almost
+  // always the intended panel scroller. Fall back to the first generic
+  // scrollable ancestor, and only as a last resort the page-level scroller.
+  // We avoid defaulting to the page scroller because some surfaces reset it
+  // whenever new virtualized content renders.
   function findScroller(start) {
     let node = start;
-    while (node && node !== document.documentElement) {
+    let genericScrollable = null;
+    while (node && node !== document.body) {
       if (node.scrollHeight > node.clientHeight + 4) {
+        if (!genericScrollable) genericScrollable = node;
         const oy = window.getComputedStyle(node).overflowY;
         if (oy === "auto" || oy === "scroll" || oy === "overlay") {
           return node;
@@ -318,8 +321,23 @@
       }
       node = node.parentElement;
     }
-    // Nothing with an explicit overflow found; fall back to the page scroller.
-    return document.scrollingElement || document.documentElement;
+    // Some panels put the scroller INSIDE the list container rather than
+    // around it. Check descendants for an explicit-overflow scroll host.
+    const descendants = start.querySelectorAll("*");
+    for (let i = 0; i < descendants.length && i < 500; i++) {
+      const el = descendants[i];
+      if (el.scrollHeight > el.clientHeight + 4) {
+        const oy = window.getComputedStyle(el).overflowY;
+        if (oy === "auto" || oy === "scroll" || oy === "overlay") {
+          return el;
+        }
+      }
+    }
+    return (
+      genericScrollable ||
+      document.scrollingElement ||
+      document.documentElement
+    );
   }
 
   // Build a dedupe key for a turn. We key on speaker + timestamp + a prefix of
@@ -340,13 +358,43 @@
   //
   // Returns { turns, timedOut }.
   async function scrollAndCollectTurns(container, port, isCancelled) {
-    const scroller = findScroller(container);
+    let scroller = findScroller(container);
     const collected = new Map();
     const collectOrder = [];
     // Secondary dedup guard keyed on speaker+timestamp only. Catches cases
     // where the text differs slightly across scroll resets (e.g. partial
     // renders at the boundary) but the segment is the same logical utterance.
     const seenSegments = new Set();
+
+    // Disable CSS scroll anchoring on the scroller (and, defensively, its
+    // ancestor chain) while we scrape. Scroll anchoring is the browser-level
+    // feature that repositions scrollTop to keep the currently-anchored
+    // element visible when new content is inserted above it. In a virtualized
+    // transcript list that injects rows above the viewport as you scroll,
+    // this causes scrollTop to get snapped back toward 0 mid-export.
+    const savedAnchors = [];
+    function pinScrollAnchor(el) {
+      if (!el || !el.style) return;
+      savedAnchors.push({ el, prev: el.style.overflowAnchor });
+      try {
+        el.style.overflowAnchor = "none";
+      } catch (_) {}
+    }
+    function restoreScrollAnchors() {
+      for (const { el, prev } of savedAnchors) {
+        try {
+          el.style.overflowAnchor = prev || "";
+        } catch (_) {}
+      }
+    }
+    pinScrollAnchor(scroller);
+    let anc = scroller && scroller.parentElement;
+    let depth = 0;
+    while (anc && depth < 6) {
+      pinScrollAnchor(anc);
+      anc = anc.parentElement;
+      depth += 1;
+    }
 
     // Push a turn into the collection, preserving first-seen order.
     function absorb(turn) {
@@ -367,6 +415,21 @@
       for (const t of turns) absorb(t);
     }
 
+    // Re-find the scroller if the current one was detached from the DOM.
+    // Teams/Stream occasionally swaps out the virtualized list's scroll host
+    // when the user toggles the panel or the tab refocuses. Without this, the
+    // stale reference silently no-ops on scrollTop writes and the scraper
+    // thinks it's stuck.
+    function refreshScrollerIfDetached() {
+      if (!scroller || !scroller.isConnected) {
+        const fresh = findScroller(container);
+        if (fresh) {
+          scroller = fresh;
+          pinScrollAnchor(scroller);
+        }
+      }
+    }
+
     const startTime = Date.now();
 
     // Start at the very top so rows render from the beginning of the meeting.
@@ -378,98 +441,121 @@
     let stableStuck = 0;
     let lastScrollTop = -1;
     let lastHeight = -1;
+    let writeIgnoredCount = 0;
 
-    // The outer loop drives the scroll downward until we have been at the
-    // very bottom, with stable scrollHeight, for several consecutive checks.
-    // We deliberately require multiple stable confirmations because Stream's
-    // virtualized list grows its scrollHeight as new rows are fetched.
-    while (true) {
-      if (isCancelled && isCancelled()) {
+    function finish(timedOut) {
+      try {
         scroller.scrollTop = 0;
-        return {
-          turns: collectOrder.map((k) => collected.get(k)),
-          timedOut: false,
-        };
-      }
+      } catch (_) {}
+      restoreScrollAnchors();
+      return {
+        turns: collectOrder.map((k) => collected.get(k)),
+        timedOut,
+      };
+    }
 
-      if (Date.now() - startTime > MAX_SCROLL_MS) {
-        scroller.scrollTop = 0;
-        return {
-          turns: collectOrder.map((k) => collected.get(k)),
-          timedOut: true,
-        };
-      }
+    try {
+      // The outer loop drives the scroll downward until we have been at the
+      // very bottom, with stable scrollHeight, for several consecutive checks.
+      // We deliberately require multiple stable confirmations because Stream's
+      // virtualized list grows its scrollHeight as new rows are fetched.
+      while (true) {
+        if (isCancelled && isCancelled()) {
+          return finish(false);
+        }
 
-      const beforeScroll = scroller.scrollTop;
-      const beforeHeight = scroller.scrollHeight;
-      const viewport = scroller.clientHeight || window.innerHeight || 600;
+        if (Date.now() - startTime > MAX_SCROLL_MS) {
+          return finish(true);
+        }
 
-      // Advance by ~70% of viewport height so there is overlap between scrape
-      // steps and no row gets skipped.
-      scroller.scrollTop = beforeScroll + viewport * 0.7;
-      await sleep(SCROLL_STEP_DELAY_MS);
-      scrapeOnce();
+        refreshScrollerIfDetached();
 
-      const afterScroll = scroller.scrollTop;
-      const afterHeight = scroller.scrollHeight;
+        const beforeScroll = scroller.scrollTop;
+        const beforeHeight = scroller.scrollHeight;
+        const viewport = scroller.clientHeight || window.innerHeight || 600;
+        const targetTop = beforeScroll + viewport * 0.7;
 
-      // Report scroll progress so the popup can show something is happening.
-      if (port && afterHeight > 0) {
-        const pct = Math.min(100, Math.round((afterScroll / afterHeight) * 100));
-        try {
-          port.postMessage({
-            type: "progress",
-            message: "Reading transcript... " + pct + "%",
-            detail: collectOrder.length + " turns collected",
-          });
-        } catch (_) {}
-      }
-      const atBottom =
-        afterScroll + scroller.clientHeight >= afterHeight - 4;
-
-      if (atBottom) {
-        // Wait for any trailing lazy fetches to land, then re-scrape.
-        await sleep(SETTLE_DELAY_MS);
-        scrapeOnce();
-        // Jump to the exact bottom to trigger any "almost there" fetches.
-        scroller.scrollTop = scroller.scrollHeight;
-        await sleep(SETTLE_DELAY_MS);
+        // Advance by ~70% of viewport height so there is overlap between
+        // scrape steps and no row gets skipped.
+        scroller.scrollTop = targetTop;
+        await sleep(SCROLL_STEP_DELAY_MS);
         scrapeOnce();
 
-        if (scroller.scrollHeight === afterHeight) {
-          stableAtBottom += 1;
-          if (stableAtBottom >= 4) {
-            // Truly done. Reset scroll position for the user's convenience.
-            scroller.scrollTop = 0;
-            return {
-              turns: collectOrder.map((k) => collected.get(k)),
-              timedOut: false,
-            };
+        const afterScroll = scroller.scrollTop;
+        const afterHeight = scroller.scrollHeight;
+
+        // Detect "write was ignored" — we tried to move forward but scrollTop
+        // didn't actually advance AND the panel has more content below. This
+        // usually means we're bound to the wrong element (e.g. the page
+        // scroller). Re-resolve the scroller and try again before bailing.
+        if (
+          afterScroll <= beforeScroll + 1 &&
+          afterHeight > (beforeScroll + viewport + 4)
+        ) {
+          writeIgnoredCount += 1;
+          if (writeIgnoredCount === 2) {
+            const fresh = findScroller(container);
+            if (fresh && fresh !== scroller) {
+              scroller = fresh;
+              pinScrollAnchor(scroller);
+            }
+          }
+        } else {
+          writeIgnoredCount = 0;
+        }
+
+        // Report scroll progress so the popup can show something is happening.
+        if (port && afterHeight > 0) {
+          const pct = Math.min(100, Math.round((afterScroll / afterHeight) * 100));
+          try {
+            port.postMessage({
+              type: "progress",
+              message: "Reading transcript... " + pct + "%",
+              detail: collectOrder.length + " turns collected",
+            });
+          } catch (_) {}
+        }
+        const atBottom =
+          afterScroll + scroller.clientHeight >= afterHeight - 4;
+
+        if (atBottom) {
+          // Wait for any trailing lazy fetches to land, then re-scrape.
+          await sleep(SETTLE_DELAY_MS);
+          scrapeOnce();
+          // Jump to the exact bottom to trigger any "almost there" fetches.
+          scroller.scrollTop = scroller.scrollHeight;
+          await sleep(SETTLE_DELAY_MS);
+          scrapeOnce();
+
+          if (scroller.scrollHeight === afterHeight) {
+            stableAtBottom += 1;
+            if (stableAtBottom >= 4) {
+              // Truly done.
+              return finish(false);
+            }
+          } else {
+            stableAtBottom = 0;
           }
         } else {
           stableAtBottom = 0;
         }
-      } else {
-        stableAtBottom = 0;
-      }
 
-      // Guard against a stuck scroller (e.g. transcript shorter than the
-      // viewport). If neither the scrollTop nor the scrollHeight has changed
-      // for several consecutive iterations, assume we're done.
-      if (afterScroll === lastScrollTop && afterHeight === lastHeight) {
-        stableStuck += 1;
-        if (stableStuck >= 6) {
-          scroller.scrollTop = 0;
-          return {
-            turns: collectOrder.map((k) => collected.get(k)),
-            timedOut: false,
-          };
+        // Guard against a stuck scroller (e.g. transcript shorter than the
+        // viewport). If neither the scrollTop nor the scrollHeight has changed
+        // for several consecutive iterations, assume we're done.
+        if (afterScroll === lastScrollTop && afterHeight === lastHeight) {
+          stableStuck += 1;
+          if (stableStuck >= 6) {
+            return finish(false);
+          }
+        } else {
+          stableStuck = 0;
+          lastScrollTop = afterScroll;
+          lastHeight = afterHeight;
         }
-      } else {
-        stableStuck = 0;
-        lastScrollTop = afterScroll;
-        lastHeight = afterHeight;
       }
+    } finally {
+      restoreScrollAnchors();
     }
   }
 
@@ -489,19 +575,19 @@
     const isSharePoint = host.endsWith(".sharepoint.com");
 
     if (isSharePoint) {
-      const patternTurns = scrapeTurnsByPattern(container);
-      if (patternTurns.length > 0) return patternTurns;
+      // SharePoint Stream: use only the pattern scraper. The selector scraper
+      // on this surface picks up generic listitem continuation rows (utterance
+      // fragments that don't carry a speaker element) and emits them as
+      // speakerless turns, which then render as "Unknown speaker" blocks.
+      return scrapeTurnsByPattern(container);
     }
 
     const selectorTurns = scrapeTurnsBySelector(container);
     if (selectorTurns.length > 0) return selectorTurns;
 
-    // Last resort: try the pattern scraper even on Teams native pages. It's
-    // slower but doesn't need class names.
-    if (!isSharePoint) {
-      return scrapeTurnsByPattern(container);
-    }
-    return [];
+    // Last resort on Teams native: pattern scraper. Slower but doesn't need
+    // class names.
+    return scrapeTurnsByPattern(container);
   }
 
   // The original selector/attribute-driven scraper. Good for Teams native
@@ -615,20 +701,6 @@
         turn: {
           speaker: c1.text.trim(),
           timestamp: c2.text.trim(),
-          text: "",
-        },
-        consumed: 2,
-        hasInlineText: false,
-      };
-    }
-
-    // Case D: "TIME" then "Name" — timestamp appears before the name in DOM
-    // order (seen in some SharePoint Stream transcript panel layouts).
-    if (TIME_ONLY_RE.test(c1.text) && c2 && looksLikeName(c2.text)) {
-      return {
-        turn: {
-          speaker: c2.text.trim(),
-          timestamp: c1.text.trim(),
           text: "",
         },
         consumed: 2,
@@ -976,24 +1048,43 @@
   // Merge consecutive rows from the same speaker into a single block. The
   // first timestamp wins; subsequent text is appended as additional sentences.
   function mergeAdjacentTurns(turns) {
+    // If at least one turn has a speaker, treat speakerless turns as
+    // continuations: attach their text to the preceding speaker's block,
+    // or drop them if they're leading noise that appears before any
+    // speakered turn (system banners, "AI-generated content" notices, etc.).
+    // If NO turn has a speaker at all (scraper couldn't identify any), keep
+    // every turn as-is so we preserve the spoken content rather than emitting
+    // an empty transcript.
+    const hasAnySpeaker = turns.some((t) => t.speaker);
+
     const merged = [];
     for (const turn of turns) {
       const last = merged[merged.length - 1];
-      // A turn with no speaker is a continuation fragment whose header element
-      // wasn't found by the scraper. Attach its text to the previous speaker's
-      // block rather than emitting a separate "Unknown speaker" entry.
-      if (!turn.speaker) {
-        if (last && turn.text) {
-          last.text = (last.text + " " + turn.text).replace(/\s+/g, " ").trim();
+
+      if (hasAnySpeaker && !turn.speaker) {
+        // Continuation of the previous speaker's block (or leading noise if
+        // there is no previous block yet).
+        if (last && last.speaker && turn.text) {
+          last.text = (last.text + " " + turn.text)
+            .replace(/\s+/g, " ")
+            .trim();
           if (!last.timestamp && turn.timestamp) {
             last.timestamp = turn.timestamp;
           }
         }
         continue;
       }
-      if (last && last.speaker && last.speaker === turn.speaker) {
+
+      if (
+        last &&
+        last.speaker &&
+        turn.speaker &&
+        last.speaker === turn.speaker
+      ) {
         if (turn.text) {
-          last.text = (last.text + " " + turn.text).replace(/\s+/g, " ").trim();
+          last.text = (last.text + " " + turn.text)
+            .replace(/\s+/g, " ")
+            .trim();
         }
         if (!last.timestamp && turn.timestamp) {
           last.timestamp = turn.timestamp;
