@@ -24,13 +24,19 @@
 
   // Pause between incremental scroll steps. Teams renders virtualized
   // chunks; too fast and we skip rendering of newly-injected rows, causing
-  // the lazy-load mechanism to reset. 500 ms gives each batch of DOM nodes
-  // time to settle before the next scroll fires.
-  const SCROLL_STEP_DELAY_MS = 500;
+  // the lazy-load mechanism to reset. 250 ms is the default — fast enough to
+  // feel responsive on short meetings but long enough for Fluent UI to
+  // settle a batch of new rows.
+  const SCROLL_STEP_DELAY_MS = 250;
 
   // After we hit the bottom we wait this long and re-check whether the page
   // grew. If it didn't, we proceed with what we have.
-  const SETTLE_DELAY_MS = 800;
+  const SETTLE_DELAY_MS = 600;
+
+  // Extra wait when we've just jumped to the very bottom of the list, to let
+  // Stream fetch any trailing virtualized rows before we treat the height as
+  // final.
+  const BOTTOM_SETTLE_DELAY_MS = 1200;
 
   // Listen for port connections from the popup. The popup opens a long-lived
   // Port named "meetmark", sends { type: "start" } to begin, and listens for
@@ -222,7 +228,13 @@
   // tenants serve Teams meeting recordings and their transcripts.
   function findTranscriptContainer() {
     const containerSelectors = [
-      // SharePoint Stream (stream.aspx) — known stable data-automationid hooks.
+      // SharePoint Stream (stream.aspx) current transcript panel (2026+).
+      // This is the scrollable FocusZone that wraps the ms-List of cells.
+      "#scrollToTargetTargetedFocusZone",
+      '[data-testid="scroll-to-target-targeted-focus-zone"]',
+      '[data-focuszone-id][data-is-scrollable="true"]',
+
+      // SharePoint Stream (stream.aspx) — older stable data-automationid hooks.
       '[data-automationid="transcript-virtualized-list"]',
       '[data-automationid="transcriptList"]',
       '[data-automationid="transcript-list"]',
@@ -275,11 +287,69 @@
     );
     if (found) return found;
 
+    // If the page has Fluent UI ms-List-cell entries (Stream's new transcript
+    // DOM), walk up from any cell to the nearest scrollable ancestor. This
+    // locates the panel even when none of the named selectors above hit.
+    const cellBased = findContainerFromListCells();
+    if (cellBased) return cellBased;
+
     // Last-resort heuristic: the transcript container is the deepest DOM
     // element that contains at least three timestamp-like strings (e.g.
     // "0:03", "7:24"). Transcript panels are uniquely timestamp-dense;
     // no other sidebar panel looks like this.
     return findContainerByTimestampDensity();
+  }
+
+  // Locate the transcript panel via its child cells. Stream renders each row
+  // as <div data-automationid="ListCell"> inside a virtualized ms-List, and
+  // those cells are a very stable hook even when surrounding class names get
+  // new Fluent UI hashes. We pick a cell, walk up to the nearest scrollable
+  // ancestor, and use that element as the container.
+  function findContainerFromListCells() {
+    const cells = document.querySelectorAll('[data-automationid="ListCell"]');
+    if (!cells.length) return null;
+
+    // Prefer cells that look transcript-y: they contain a sub-entry or an
+    // entryText-* element. This avoids landing on unrelated ms-List usages
+    // elsewhere on the page.
+    let anchor = null;
+    for (const cell of cells) {
+      if (
+        cell.querySelector('[id^="sub-entry"]') ||
+        cell.querySelector('[class*="entryText"]') ||
+        cell.querySelector('[class*="eventText"]')
+      ) {
+        anchor = cell;
+        break;
+      }
+    }
+    if (!anchor) anchor = cells[0];
+
+    let node = anchor.parentElement;
+    while (node && node !== document.body) {
+      if (node.scrollHeight > node.clientHeight + 4) {
+        const oy = window.getComputedStyle(node).overflowY;
+        if (oy === "auto" || oy === "scroll" || oy === "overlay") {
+          console.log(
+            "[MeetMark] transcript container found via ListCell walk"
+          );
+          return node;
+        }
+      }
+      if (node.getAttribute && node.getAttribute("data-is-scrollable") === "true") {
+        console.log(
+          "[MeetMark] transcript container found via data-is-scrollable"
+        );
+        return node;
+      }
+      node = node.parentElement;
+    }
+
+    // No scrollable ancestor — return the nearest ms-List or its parent
+    // so at least scraping can still run over the rendered cells.
+    const list = anchor.closest('[role="list"], .ms-List');
+    if (list) return list.parentElement || list;
+    return anchor.parentElement || anchor;
   }
 
   // Walk visible block-level elements and return the deepest one that
@@ -432,31 +502,34 @@
     );
   }
 
-  // Build a dedupe key for a turn. We key on speaker + timestamp + a prefix of
-  // the text so that the same row captured by two different scroll positions
-  // only ends up in the output once.
+  // Build a dedupe key for a turn. When the scraper emits a data-list-index
+  // (Stream's ListCell rows), key on that directly — it's unique and stable
+  // across the virtualized list's re-renders. Otherwise fall back to a
+  // speaker + timestamp + text-prefix composite.
   function turnKey(turn) {
+    if (typeof turn.index === "number" && turn.index >= 0) {
+      return "idx:" + turn.index;
+    }
     const speaker = (turn.speaker || "").toLowerCase().trim();
     const ts = (turn.timestamp || "").trim();
     const textPrefix = (turn.text || "").slice(0, 80).toLowerCase().trim();
     return speaker + "|" + ts + "|" + textPrefix;
   }
 
-  // Scroll incrementally from the top of the transcript to the bottom,
-  // scraping visible rows at every step. Because the list is virtualized,
-  // rows outside the viewport get removed from the DOM; scraping at every
-  // step and deduping by { speaker, timestamp, text-prefix } is the only
-  // way to collect the full transcript.
+  // Scroll to the very bottom of the transcript first so the virtualized
+  // list materialises every row's height (and any lazy-loaded trailing
+  // fetches arrive). Then scroll back to the top and crawl down, scraping
+  // at every step and deduping by data-list-index.
+  //
+  // Stream's ms-List exposes aria-setsize on every rendered row, which tells
+  // us the expected total number of entries; we use that as an early-stop
+  // condition to avoid an unnecessary bottom-stability loop.
   //
   // Returns { turns, timedOut }.
   async function scrollAndCollectTurns(container, port, isCancelled) {
     let scroller = findScroller(container);
     const collected = new Map();
     const collectOrder = [];
-    // Secondary dedup guard keyed on speaker+timestamp only. Catches cases
-    // where the text differs slightly across scroll resets (e.g. partial
-    // renders at the boundary) but the segment is the same logical utterance.
-    const seenSegments = new Set();
 
     // Disable CSS scroll anchoring on the scroller (and, defensively, its
     // ancestor chain) while we scrape. Scroll anchoring is the browser-level
@@ -488,16 +561,29 @@
       depth += 1;
     }
 
-    // Push a turn into the collection, preserving first-seen order.
+    // Push a turn into the collection, preserving first-seen order. When the
+    // scraper supplied a data-list-index we key on that, which is unique and
+    // stable and lets us keep distinct turns that happen to share a speaker
+    // and timestamp.
     function absorb(turn) {
       if (!turn) return;
       if (!turn.speaker && !turn.text) return;
-      const segKey = (turn.speaker || "") + "|" + (turn.timestamp || "");
-      if (segKey !== "|" && seenSegments.has(segKey)) return;
       const key = turnKey(turn);
-      if (collected.has(key)) return;
-      if (segKey !== "|") seenSegments.add(segKey);
-      collected.set(key, turn);
+      if (collected.has(key)) {
+        // Re-render may have filled in details that were missing earlier
+        // (e.g. speaker on a continuation row the scraper has since been
+        // able to propagate). Keep the version with more information.
+        const existing = collected.get(key);
+        if (!existing.speaker && turn.speaker) existing.speaker = turn.speaker;
+        if (!existing.timestamp && turn.timestamp) {
+          existing.timestamp = turn.timestamp;
+        }
+        if ((turn.text || "").length > (existing.text || "").length) {
+          existing.text = turn.text;
+        }
+        return;
+      }
+      collected.set(key, { ...turn });
       collectOrder.push(key);
     }
 
@@ -522,48 +608,111 @@
       }
     }
 
-    const startTime = Date.now();
+    function reportProgress(phase, pct, detail) {
+      if (!port) return;
+      try {
+        port.postMessage({
+          type: "progress",
+          message: phase + "... " + Math.min(100, Math.max(0, pct)) + "%",
+          detail: detail || (collectOrder.length + " turns collected"),
+        });
+      } catch (_) {}
+    }
 
-    // Start at the very top so rows render from the beginning of the meeting.
+    const startTime = Date.now();
+    let timedOut = false;
+
+    function finish() {
+      try {
+        scroller.scrollTop = 0;
+      } catch (_) {}
+      restoreScrollAnchors();
+      const turns = collectOrder
+        .map((k) => collected.get(k))
+        .sort((a, b) => {
+          // When we have data-list-index on every turn, sort by it so the
+          // output matches the transcript's natural order even if scrape
+          // order jumped around during scrolling.
+          const ai = typeof a.index === "number" ? a.index : -1;
+          const bi = typeof b.index === "number" ? b.index : -1;
+          if (ai >= 0 && bi >= 0) return ai - bi;
+          return 0;
+        });
+      return { turns, timedOut };
+    }
+
+    // Phase 1: scroll to the bottom. This forces the virtualized list to
+    // settle its total scrollHeight and makes sure any lazy-loaded trailing
+    // rows have been fetched before we start collecting in order.
+    reportProgress("Loading transcript", 0, "scrolling to bottom");
+    try {
+      let bottomStable = 0;
+      let lastHeight = -1;
+      // Up to ~20 bottom jumps (each followed by a settle wait). 20 × 1200ms
+      // = 24s worst case before we give up waiting for more trailing rows.
+      for (let i = 0; i < 20; i++) {
+        if (isCancelled && isCancelled()) return finish();
+        if (Date.now() - startTime > MAX_SCROLL_MS) {
+          timedOut = true;
+          break;
+        }
+        refreshScrollerIfDetached();
+        scroller.scrollTop = scroller.scrollHeight;
+        await sleep(BOTTOM_SETTLE_DELAY_MS);
+        // Grab visible (bottom) rows while we're here.
+        scrapeOnce();
+
+        const h = scroller.scrollHeight;
+        if (h === lastHeight) {
+          bottomStable += 1;
+          if (bottomStable >= 2) break;
+        } else {
+          bottomStable = 0;
+          lastHeight = h;
+        }
+        reportProgress(
+          "Loading transcript",
+          50 + i * 2,
+          "waiting for trailing rows"
+        );
+      }
+    } catch (_) {
+      // Non-fatal — fall through to the top-to-bottom pass.
+    }
+
+    // Phase 2: jump back to the top and crawl down scraping at each step.
     scroller.scrollTop = 0;
     await sleep(SETTLE_DELAY_MS);
     scrapeOnce();
 
+    const expectedTotal = readExpectedRowCount(container);
     let stableAtBottom = 0;
     let stableStuck = 0;
     let lastScrollTop = -1;
     let lastHeight = -1;
     let writeIgnoredCount = 0;
 
-    function finish(timedOut) {
-      try {
-        scroller.scrollTop = 0;
-      } catch (_) {}
-      restoreScrollAnchors();
-      return {
-        turns: collectOrder.map((k) => collected.get(k)),
-        timedOut,
-      };
-    }
-
     try {
       // The outer loop drives the scroll downward until we have been at the
-      // very bottom, with stable scrollHeight, for several consecutive checks.
-      // We deliberately require multiple stable confirmations because Stream's
-      // virtualized list grows its scrollHeight as new rows are fetched.
+      // very bottom, with stable scrollHeight, for several consecutive checks
+      // — or until we have collected every row we expected.
       while (true) {
-        if (isCancelled && isCancelled()) {
-          return finish(false);
-        }
+        if (isCancelled && isCancelled()) break;
 
         if (Date.now() - startTime > MAX_SCROLL_MS) {
-          return finish(true);
+          timedOut = true;
+          break;
+        }
+
+        // Early-stop: Stream tells us how many rows the list has via
+        // aria-setsize. Once we've collected that many, we can exit.
+        if (expectedTotal > 0 && collectOrder.length >= expectedTotal) {
+          break;
         }
 
         refreshScrollerIfDetached();
 
         const beforeScroll = scroller.scrollTop;
-        const beforeHeight = scroller.scrollHeight;
         const viewport = scroller.clientHeight || window.innerHeight || 600;
         const targetTop = beforeScroll + viewport * 0.7;
 
@@ -596,17 +745,20 @@
           writeIgnoredCount = 0;
         }
 
-        // Report scroll progress so the popup can show something is happening.
-        if (port && afterHeight > 0) {
-          const pct = Math.min(100, Math.round((afterScroll / afterHeight) * 100));
-          try {
-            port.postMessage({
-              type: "progress",
-              message: "Reading transcript... " + pct + "%",
-              detail: collectOrder.length + " turns collected",
-            });
-          } catch (_) {}
+        // Report collection progress so the popup can show something is
+        // happening. Prefer a count-based metric when we know the total.
+        if (expectedTotal > 0) {
+          const pct = Math.round((collectOrder.length / expectedTotal) * 100);
+          reportProgress(
+            "Reading transcript",
+            pct,
+            collectOrder.length + " of " + expectedTotal + " turns"
+          );
+        } else if (afterHeight > 0) {
+          const pct = Math.round((afterScroll / afterHeight) * 100);
+          reportProgress("Reading transcript", pct);
         }
+
         const atBottom =
           afterScroll + scroller.clientHeight >= afterHeight - 4;
 
@@ -614,17 +766,9 @@
           // Wait for any trailing lazy fetches to land, then re-scrape.
           await sleep(SETTLE_DELAY_MS);
           scrapeOnce();
-          // Jump to the exact bottom to trigger any "almost there" fetches.
-          scroller.scrollTop = scroller.scrollHeight;
-          await sleep(SETTLE_DELAY_MS);
-          scrapeOnce();
-
           if (scroller.scrollHeight === afterHeight) {
             stableAtBottom += 1;
-            if (stableAtBottom >= 4) {
-              // Truly done.
-              return finish(false);
-            }
+            if (stableAtBottom >= 3) break;
           } else {
             stableAtBottom = 0;
           }
@@ -637,9 +781,7 @@
         // for several consecutive iterations, assume we're done.
         if (afterScroll === lastScrollTop && afterHeight === lastHeight) {
           stableStuck += 1;
-          if (stableStuck >= 6) {
-            return finish(false);
-          }
+          if (stableStuck >= 6) break;
         } else {
           stableStuck = 0;
           lastScrollTop = afterScroll;
@@ -649,6 +791,8 @@
     } finally {
       restoreScrollAnchors();
     }
+
+    return finish();
   }
 
   // ---------------------------------------------------------------------------
@@ -663,6 +807,14 @@
   // that yields nothing we fall back to the class/attribute-driven scraper
   // which works for native Teams surfaces.
   function scrapeTurns(container) {
+    // Stream's current transcript panel renders each row as a
+    // [data-automationid="ListCell"] with stable internal class hooks for
+    // speaker, timestamp, and utterance. When those cells are present, use
+    // them directly — they give us an exact row count via aria-setsize and a
+    // stable dedupe key via data-list-index.
+    const streamTurns = scrapeTurnsFromStreamCells(container);
+    if (streamTurns && streamTurns.length) return streamTurns;
+
     // The pattern scraper walks text-leaf DOM elements in document order and
     // groups them by the Name → HH:MM → Text cadence that every Teams/Stream
     // transcript follows, regardless of class or attribute naming. Running it
@@ -679,6 +831,101 @@
     // produces nothing (e.g. closed-captions panels with known data-tid hooks
     // and very short visible windows that don't expose the name+time header).
     return scrapeTurnsBySelector(container);
+  }
+
+  // Direct scraper for SharePoint Stream's current transcript DOM. Each row
+  // is a <div data-automationid="ListCell" data-list-index="N">. The row's
+  // speaker (inside [class*="itemDisplayName"]) only renders when the speaker
+  // changes from the previous row, so continuation rows inherit the last
+  // seen speaker. System banners like "X started transcription" are dropped.
+  //
+  // Each turn carries its data-list-index as `index` so the scroll loop can
+  // dedupe virtualized-list re-renders precisely without relying on the
+  // text-prefix heuristic.
+  function scrapeTurnsFromStreamCells(container) {
+    const cells = container.querySelectorAll(
+      '[data-automationid="ListCell"]'
+    );
+    if (!cells.length) return null;
+
+    const turns = [];
+    for (const cell of cells) {
+      const turn = extractTurnFromStreamCell(cell);
+      if (turn) turns.push(turn);
+    }
+    // Propagate speaker from the previous cell onto continuation rows that
+    // don't render their own speaker label.
+    let lastSpeaker = "";
+    for (const turn of turns) {
+      if (turn.speaker) {
+        lastSpeaker = turn.speaker;
+      } else if (lastSpeaker) {
+        turn.speaker = lastSpeaker;
+      }
+    }
+    return turns;
+  }
+
+  // Extract one { speaker, timestamp, text, index } record from a single
+  // Stream ListCell. Returns null for non-transcript cells (disclaimers,
+  // transcription-started banners, or cells with no utterance text).
+  function extractTurnFromStreamCell(cell) {
+    // The first cell is Stream's "AI-generated content may be incorrect"
+    // disclaimer and the "started transcription" banner. Skip both.
+    const eventText = cell.querySelector('[class*="eventText"]');
+    if (eventText) {
+      const t = (eventText.innerText || eventText.textContent || "").trim();
+      if (/^(.*?\s+)?(started|stopped|paused|resumed)\s+transcription\b/i.test(t)) {
+        return null;
+      }
+    }
+
+    const speakerEl = cell.querySelector('[class*="itemDisplayName"]');
+    const speaker = speakerEl
+      ? (speakerEl.innerText || speakerEl.textContent || "").trim()
+      : "";
+
+    // Digital timestamp lives in an aria-hidden span inside baseTimestamp.
+    let timestamp = "";
+    const tsEl =
+      cell.querySelector('[id^="Header-timestamp"]') ||
+      cell.querySelector('[class*="baseTimestamp"] [aria-hidden="true"]');
+    if (tsEl) timestamp = (tsEl.innerText || tsEl.textContent || "").trim();
+
+    // Utterance text. `sub-entry-*` is the stable hook; `entryText-*` is the
+    // Fluent UI class that carries the text content.
+    let textEl =
+      cell.querySelector('[id^="sub-entry"]') ||
+      cell.querySelector('[class*="entryText"]');
+    let text = "";
+    if (textEl) {
+      text = extractText(textEl).replace(/\s+/g, " ").trim();
+    } else if (eventText) {
+      // Non-banner event cells (rare) — keep their text.
+      text = extractText(eventText).replace(/\s+/g, " ").trim();
+    }
+
+    if (!text && !speaker) return null;
+
+    const indexAttr = cell.getAttribute("data-list-index");
+    const index = indexAttr !== null ? parseInt(indexAttr, 10) : -1;
+
+    return {
+      speaker,
+      timestamp: normalizeTimestamp(timestamp),
+      text,
+      index: Number.isFinite(index) ? index : -1,
+    };
+  }
+
+  // Read aria-setsize from any transcript row in the container. Stream sets
+  // this to the total number of items in the list, which lets the scroll
+  // loop know when it has collected everything. Returns 0 if absent.
+  function readExpectedRowCount(container) {
+    const anySetSize = container.querySelector("[aria-setsize]");
+    if (!anySetSize) return 0;
+    const v = parseInt(anySetSize.getAttribute("aria-setsize") || "0", 10);
+    return Number.isFinite(v) && v > 0 ? v : 0;
   }
 
   // The original selector/attribute-driven scraper. Good for Teams native
