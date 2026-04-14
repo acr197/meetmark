@@ -301,17 +301,24 @@
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
-  // Determine which element actually scrolls. Some surfaces scroll the
-  // container itself; others scroll a parent. Walk up until we find one
-  // whose scrollHeight exceeds its clientHeight by a meaningful margin.
+  // Determine which element actually scrolls the transcript panel. Walk up
+  // from the container looking for the nearest ancestor that has an explicit
+  // overflow-y style and scrollable content. Preferring an element with an
+  // explicit overflow style avoids accidentally selecting the page-level
+  // scroller (document.scrollingElement), which Teams/Stream may reset
+  // whenever it renders new content into the page.
   function findScroller(start) {
     let node = start;
-    while (node && node !== document.body) {
+    while (node && node !== document.documentElement) {
       if (node.scrollHeight > node.clientHeight + 4) {
-        return node;
+        const oy = window.getComputedStyle(node).overflowY;
+        if (oy === "auto" || oy === "scroll" || oy === "overlay") {
+          return node;
+        }
       }
       node = node.parentElement;
     }
+    // Nothing with an explicit overflow found; fall back to the page scroller.
     return document.scrollingElement || document.documentElement;
   }
 
@@ -336,13 +343,20 @@
     const scroller = findScroller(container);
     const collected = new Map();
     const collectOrder = [];
+    // Secondary dedup guard keyed on speaker+timestamp only. Catches cases
+    // where the text differs slightly across scroll resets (e.g. partial
+    // renders at the boundary) but the segment is the same logical utterance.
+    const seenSegments = new Set();
 
     // Push a turn into the collection, preserving first-seen order.
     function absorb(turn) {
       if (!turn) return;
       if (!turn.speaker && !turn.text) return;
+      const segKey = (turn.speaker || "") + "|" + (turn.timestamp || "");
+      if (segKey !== "|" && seenSegments.has(segKey)) return;
       const key = turnKey(turn);
       if (collected.has(key)) return;
+      if (segKey !== "|") seenSegments.add(segKey);
       collected.set(key, turn);
       collectOrder.push(key);
     }
@@ -601,6 +615,20 @@
         turn: {
           speaker: c1.text.trim(),
           timestamp: c2.text.trim(),
+          text: "",
+        },
+        consumed: 2,
+        hasInlineText: false,
+      };
+    }
+
+    // Case D: "TIME" then "Name" — timestamp appears before the name in DOM
+    // order (seen in some SharePoint Stream transcript panel layouts).
+    if (TIME_ONLY_RE.test(c1.text) && c2 && looksLikeName(c2.text)) {
+      return {
+        turn: {
+          speaker: c2.text.trim(),
+          timestamp: c1.text.trim(),
           text: "",
         },
         consumed: 2,
@@ -951,6 +979,18 @@
     const merged = [];
     for (const turn of turns) {
       const last = merged[merged.length - 1];
+      // A turn with no speaker is a continuation fragment whose header element
+      // wasn't found by the scraper. Attach its text to the previous speaker's
+      // block rather than emitting a separate "Unknown speaker" entry.
+      if (!turn.speaker) {
+        if (last && turn.text) {
+          last.text = (last.text + " " + turn.text).replace(/\s+/g, " ").trim();
+          if (!last.timestamp && turn.timestamp) {
+            last.timestamp = turn.timestamp;
+          }
+        }
+        continue;
+      }
       if (last && last.speaker && last.speaker === turn.speaker) {
         if (turn.text) {
           last.text = (last.text + " " + turn.text).replace(/\s+/g, " ").trim();
@@ -1110,10 +1150,6 @@
     if (metadata.url) {
       lines.push("**Link:** " + metadata.url + "  ");
     }
-    lines.push(
-      "**Participants:** " +
-        (participants.length > 0 ? participants.join(", ") : "Unknown")
-    );
     lines.push("");
     lines.push("---");
     lines.push("");
