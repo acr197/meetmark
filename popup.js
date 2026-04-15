@@ -1,7 +1,7 @@
 // MeetMark popup controller.
-// Talks to the content script over a long-lived Port so we can stream
-// progress updates back to the popup UI and send a Cancel signal while
-// work is in flight.
+// The export starts automatically when the popup opens. The Cancel button
+// aborts immediately and closes the popup. The Export button retries after
+// a completed or failed run.
 
 document.addEventListener("DOMContentLoaded", () => {
   const exportBtn = document.getElementById("exportBtn");
@@ -13,7 +13,6 @@ document.addEventListener("DOMContentLoaded", () => {
   let port = null;
   let tabId = null;
 
-  // Render a message in the popup status area with a severity class.
   function setStatus(message, level) {
     status.textContent = message || "";
     status.className = "status " + (level || "info");
@@ -33,8 +32,6 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
-  // Check whether a URL looks like a page we can scrape: either a Microsoft
-  // Teams transcript page, or a SharePoint Stream recording page.
   function isSupportedUrl(url) {
     if (!url) return false;
     try {
@@ -54,7 +51,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
-  // Cleanly tear down a port connection and reset the UI to idle.
+  // Tear down the port and reset the UI to idle (export button re-enabled).
   function closePort() {
     if (port) {
       try {
@@ -67,9 +64,10 @@ document.addEventListener("DOMContentLoaded", () => {
     setBusy(false);
   }
 
-  // Wire up the Export button.
-  exportBtn.addEventListener("click", async () => {
-    setStatus("");
+  // Start or re-run the export. Called automatically on open and by the
+  // Export button when retrying after a completed or failed run.
+  async function startExport() {
+    setStatus("Starting...", "info");
     setDetail("");
     setBusy(true);
 
@@ -87,7 +85,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
       if (!isSupportedUrl(tab.url)) {
         setStatus(
-          "This tab isn't a Teams or SharePoint Stream page. Open a Teams recording and try again.",
+          "Open a Teams or SharePoint Stream recording page, then click Export again.",
           "error"
         );
         setBusy(false);
@@ -108,8 +106,6 @@ document.addEventListener("DOMContentLoaded", () => {
       port = chrome.tabs.connect(tab.id, { name: "meetmark" });
 
       port.onDisconnect.addListener(() => {
-        // If the content script goes away unexpectedly, treat it as an
-        // error only if we never heard a "done" / "error".
         port = null;
       });
 
@@ -137,26 +133,35 @@ document.addEventListener("DOMContentLoaded", () => {
       });
 
       port.postMessage({ type: "start" });
-      setStatus("Starting export...", "info");
+      setStatus("Reading transcript...", "info");
     } catch (err) {
-      setStatus("Error: " + (err && err.message ? err.message : String(err)), "error");
+      setStatus(
+        "Error: " + (err && err.message ? err.message : String(err)),
+        "error"
+      );
       closePort();
     }
-  });
+  }
 
-  // Wire up the Cancel button.
+  // Export / retry button.
+  exportBtn.addEventListener("click", () => startExport());
+
+  // Cancel: signal the content script, disconnect immediately, and close the
+  // popup so the user isn't left staring at a frozen UI.
   cancelBtn.addEventListener("click", () => {
-    if (!port) return;
-    setStatus("Cancelling...", "warn");
-    try {
-      port.postMessage({ type: "cancel" });
-    } catch (_) {
-      /* ignore */
+    if (port) {
+      try {
+        port.postMessage({ type: "cancel" });
+      } catch (_) {
+        /* ignore */
+      }
     }
+    closePort();
+    window.close();
   });
 
-  // Handle a "done" message from the content script: push the markdown to
-  // the service worker for download, then update status.
+  // Handle a "done" message: push markdown to the service worker for
+  // download, then update status.
   async function handleDone(msg) {
     setStatus("Converting and downloading...", "info");
     setDetail("");
@@ -187,9 +192,15 @@ document.addEventListener("DOMContentLoaded", () => {
         );
       }
     } catch (err) {
-      setStatus("Download error: " + (err && err.message ? err.message : String(err)), "error");
+      setStatus(
+        "Download error: " + (err && err.message ? err.message : String(err)),
+        "error"
+      );
     } finally {
       closePort();
     }
   }
+
+  // Begin exporting as soon as the popup opens — no button click required.
+  startExport();
 });

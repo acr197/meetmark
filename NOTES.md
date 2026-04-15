@@ -28,8 +28,8 @@
      C name-then-time, D time-then-name, and E a bare name line that was
      already confirmed in Pass 1.
    - Smoke test at `/tmp/meetmark-test.js` covered all four scenarios and
-     passed (`Jacqueline Derron` and `Rachel Piot` detected as speakers,
-     turns grouped under the right speaker in every layout).
+     passed (both test speakers detected correctly, turns grouped under
+     the right speaker in every layout).
    - On SharePoint, the selector-based scraper is deliberately **not** used
      as a fallback — it tends to produce `Unknown speaker` rows from generic
      `listitem` containers. The pattern scraper is the authoritative path.
