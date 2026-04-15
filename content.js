@@ -114,10 +114,13 @@
     // button in the Stream player sidebar. On SharePoint Stream the URL does
     // not change when the panel opens, so this is the only hint we have.
     let container = findTranscriptContainer();
+    let panelJustOpened = false;
     if (!container) {
-      const opened = await ensureTranscriptPanelOpen();
-      if (opened) {
-        container = findTranscriptContainer();
+      const panelResult = await ensureTranscriptPanelOpen();
+      container = panelResult.container;
+      panelJustOpened = panelResult.opened;
+      if (panelJustOpened && container) {
+        progress("Transcript panel opened — waiting for content to load...");
       }
     }
     if (!container) {
@@ -139,7 +142,7 @@
     // scroll step and dedupe, not just scrape once at the end.
     let collectResult;
     try {
-      collectResult = await scrollAndCollectTurns(container, port, isCancelled);
+      collectResult = await scrollAndCollectTurns(container, port, isCancelled, panelJustOpened);
     } catch (err) {
       return {
         ok: false,
@@ -158,11 +161,35 @@
       : null;
 
     const rawTurns = collectResult.turns || [];
+    const expectedTotal = collectResult.expectedTotal || 0;
     if (rawTurns.length === 0) {
       return {
         ok: false,
         error:
           "Could not find transcript content. Open the Teams meeting recording in SharePoint Stream, click 'Transcript' to show the transcript panel, let it load, then try again.",
+      };
+    }
+
+    // Guard against silently exporting a truncated transcript. When the panel
+    // was auto-opened by the extension we know the content was still loading at
+    // the start of the scroll; if we ended up with less than half the expected
+    // row count the transcript hadn't finished loading. Fail with a clear
+    // message rather than produce a file people might trust as complete.
+    if (
+      panelJustOpened &&
+      expectedTotal > 0 &&
+      !collectResult.timedOut &&
+      rawTurns.length < Math.floor(expectedTotal * 0.5)
+    ) {
+      return {
+        ok: false,
+        error:
+          "Transcript appears incomplete — captured " +
+          rawTurns.length +
+          " of " +
+          expectedTotal +
+          " expected rows. Click the Transcript tab in the sidebar, wait " +
+          "a moment for it to finish loading, then try again.",
       };
     }
 
@@ -413,10 +440,13 @@
 
   // If the user is on a SharePoint Stream page but has not clicked the
   // "Transcript" button yet, the transcript panel isn't in the DOM. Look for
-  // the sidebar button by aria-label and click it. Returns true if the panel
-  // appears (or was already open) within a few seconds.
+  // the sidebar button by aria-label and click it. Returns { container, opened }:
+  // container — the transcript container element (null if not found),
+  // opened   — true when we clicked the button ourselves (panel was not already
+  //            visible), false when it was already open.
   async function ensureTranscriptPanelOpen() {
-    if (findTranscriptContainer()) return true;
+    const existing = findTranscriptContainer();
+    if (existing) return { container: existing, opened: false };
 
     const buttonSelectors = [
       'button[aria-label="Transcript"][role="menuitem"]',
@@ -443,15 +473,32 @@
 
     if (!clicked) {
       console.log("[MeetMark] no transcript button found");
-      return false;
+      return { container: null, opened: false };
     }
 
-    // Poll for the panel to materialize.
+    // Phase A: wait for the container DOM element to appear (up to 6 seconds).
+    let container = null;
     for (let i = 0; i < 24; i++) {
       await sleep(250);
-      if (findTranscriptContainer()) return true;
+      container = findTranscriptContainer();
+      if (container) break;
     }
-    return false;
+    if (!container) return { container: null, opened: true };
+
+    // Phase B: wait for actual transcript rows to populate the panel (up to
+    // 8 more seconds). The container DOM element appears almost immediately
+    // after the button click while the transcript data is still being fetched
+    // from the server. Starting the scroll loop before any rows exist causes
+    // Phase 1 to mistake the near-empty panel height for the full content
+    // height and exit after only the initial handful of visible rows.
+    for (let i = 0; i < 32; i++) {
+      await sleep(250);
+      const cells = container.querySelectorAll('[data-automationid="ListCell"]');
+      if (cells.length >= 3) break;
+      if (readExpectedRowCount(container) > 0) break;
+    }
+
+    return { container, opened: true };
   }
 
   // ---------------------------------------------------------------------------
@@ -526,7 +573,7 @@
   // condition to avoid an unnecessary bottom-stability loop.
   //
   // Returns { turns, timedOut }.
-  async function scrollAndCollectTurns(container, port, isCancelled) {
+  async function scrollAndCollectTurns(container, port, isCancelled, panelJustOpened) {
     let scroller = findScroller(container);
     const collected = new Map();
     const collectOrder = [];
@@ -621,6 +668,9 @@
 
     const startTime = Date.now();
     let timedOut = false;
+    // Populated after Phase 1 finishes (once content has loaded) so the
+    // completeness guard in runExport can compare against the real total.
+    let expectedTotal = 0;
 
     function finish() {
       try {
@@ -638,7 +688,7 @@
           if (ai >= 0 && bi >= 0) return ai - bi;
           return 0;
         });
-      return { turns, timedOut };
+      return { turns, timedOut, expectedTotal };
     }
 
     // Phase 1: scroll to the bottom. This forces the virtualized list to
@@ -648,6 +698,11 @@
     try {
       let bottomStable = 0;
       let lastHeight = -1;
+      // When the panel was just opened we need more patience: the transcript
+      // rows are loaded from the server in batches and a brief pause between
+      // batches can make scrollHeight look stable before all rows have arrived.
+      // Require 4 consecutive stable checks (~4.8 s) instead of 2 (~2.4 s).
+      const bottomStableRequired = panelJustOpened ? 4 : 2;
       // Up to ~20 bottom jumps (each followed by a settle wait). 20 × 1200ms
       // = 24s worst case before we give up waiting for more trailing rows.
       for (let i = 0; i < 20; i++) {
@@ -665,7 +720,7 @@
         const h = scroller.scrollHeight;
         if (h === lastHeight) {
           bottomStable += 1;
-          if (bottomStable >= 2) break;
+          if (bottomStable >= bottomStableRequired) break;
         } else {
           bottomStable = 0;
           lastHeight = h;
@@ -685,7 +740,7 @@
     await sleep(SETTLE_DELAY_MS);
     scrapeOnce();
 
-    const expectedTotal = readExpectedRowCount(container);
+    expectedTotal = readExpectedRowCount(container);
     let stableAtBottom = 0;
     let stableStuck = 0;
     let lastScrollTop = -1;
