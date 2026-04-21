@@ -12,6 +12,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   let port = null;
   let tabId = null;
+  let targetFrameId = 0;
 
   function setStatus(message, level) {
     status.textContent = message || "";
@@ -94,16 +95,28 @@ document.addEventListener("DOMContentLoaded", () => {
 
       tabId = tab.id;
 
-      // Inject the content script on demand. Manifest V3 requires
-      // scripting.executeScript rather than a declared content_script.
+      // Inject the content script into every frame of the tab. On a
+      // SharePoint Stream page the transcript lives in the top frame, but on
+      // the teams.microsoft.com Calendar / Recap view the transcript is
+      // rendered inside a cross-origin SharePoint iframe (xplatIframe). We
+      // need the content script running in whichever frame owns the DOM.
       await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
+        target: { tabId: tab.id, allFrames: true },
         files: ["content.js"],
       });
 
-      // Open a long-lived Port to the content script so we can stream
-      // progress and send cancel.
-      port = chrome.tabs.connect(tab.id, { name: "meetmark" });
+      // Probe every frame to find which one actually hosts the transcript.
+      // Prefer a frame that already has transcript list cells rendered, then
+      // one that has transcript panel hooks, then fall back to a SharePoint
+      // iframe under a teams.microsoft.com parent, and finally the top frame.
+      targetFrameId = await pickTranscriptFrame(tab.id);
+
+      // Open a long-lived Port to the content script in the chosen frame so
+      // we can stream progress and send cancel.
+      port = chrome.tabs.connect(tab.id, {
+        name: "meetmark",
+        frameId: targetFrameId,
+      });
 
       port.onDisconnect.addListener(() => {
         port = null;
@@ -199,6 +212,72 @@ document.addEventListener("DOMContentLoaded", () => {
     } finally {
       closePort();
     }
+  }
+
+  // Probe every frame in the tab and decide which one the content script
+  // should scrape. Returns a frameId (0 = top). The heuristic, in order:
+  //   1. A frame whose DOM already contains Stream transcript ListCells.
+  //   2. A frame that has Teams/Stream transcript hooks (aria-label,
+  //      data-tid="Transcript", data-automationid*="transcript").
+  //   3. If the top frame is on teams.microsoft.com, the first child frame
+  //      on *.sharepoint.com — the Teams Recap xplat iframe loads from
+  //      SharePoint and is where the transcript DOM actually lives.
+  //   4. The top frame.
+  async function pickTranscriptFrame(tid) {
+    let probes;
+    try {
+      probes = await chrome.scripting.executeScript({
+        target: { tabId: tid, allFrames: true },
+        func: () => {
+          try {
+            return {
+              url: location.href,
+              hostname: location.hostname,
+              hasStreamCells:
+                document.querySelector('[data-automationid="ListCell"]') !==
+                null,
+              hasTranscriptHooks:
+                document.querySelector(
+                  '[data-tid="Transcript"],[aria-label*="ranscript" i],[data-automationid*="transcript" i]'
+                ) !== null,
+            };
+          } catch (_) {
+            return {
+              url: "",
+              hostname: "",
+              hasStreamCells: false,
+              hasTranscriptHooks: false,
+            };
+          }
+        },
+      });
+    } catch (_) {
+      return 0;
+    }
+
+    if (!probes || !probes.length) return 0;
+
+    const cellFrame = probes.find((p) => p.result && p.result.hasStreamCells);
+    if (cellFrame) return cellFrame.frameId;
+
+    const hookFrame = probes.find(
+      (p) => p.result && p.result.hasTranscriptHooks
+    );
+    if (hookFrame) return hookFrame.frameId;
+
+    const top = probes.find((p) => p.frameId === 0);
+    const topHost = (top && top.result && top.result.hostname) || "";
+    if (/(^|\.)teams\.microsoft\.com$/i.test(topHost)) {
+      const spFrame = probes.find(
+        (p) =>
+          p.frameId !== 0 &&
+          p.result &&
+          /\.sharepoint\.com$/i.test(p.result.hostname || "")
+      );
+      if (spFrame) return spFrame.frameId;
+    }
+
+    return 0;
   }
 
   // Begin exporting as soon as the popup opens — no button click required.

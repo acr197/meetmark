@@ -126,8 +126,7 @@
     if (!container) {
       return {
         ok: false,
-        error:
-          "Could not find transcript content. Open the Teams meeting recording in SharePoint Stream, click 'Transcript' to show the transcript panel, let it load, then try again.",
+        error: buildNoContainerError(),
       };
     }
 
@@ -165,8 +164,7 @@
     if (rawTurns.length === 0) {
       return {
         ok: false,
-        error:
-          "Could not find transcript content. Open the Teams meeting recording in SharePoint Stream, click 'Transcript' to show the transcript panel, let it load, then try again.",
+        error: buildNoContainerError(),
       };
     }
 
@@ -210,6 +208,40 @@
       turnCount: mergedTurns.length,
       speakerCount: participants.length,
     };
+  }
+
+  // Build the error message shown when no transcript container can be found
+  // in the frame we were asked to scrape. The guidance depends on where the
+  // content script is running: on teams.microsoft.com (Calendar / Recap),
+  // the transcript lives inside a cross-origin SharePoint iframe, so the
+  // user needs to make sure the Transcript tab inside Recap is selected and
+  // the inner frame has finished loading. Everywhere else, the SharePoint
+  // Stream instructions apply.
+  function buildNoContainerError() {
+    const host = (location.hostname || "").toLowerCase();
+    const isTeams =
+      host === "teams.microsoft.com" || host.endsWith(".teams.microsoft.com");
+    const inIframe = (function () {
+      try {
+        return window.top !== window.self;
+      } catch (_) {
+        return true;
+      }
+    })();
+
+    if (isTeams && !inIframe) {
+      return (
+        "Could not find transcript content in the Teams Recap view. Open " +
+        "the meeting in Calendar, switch to Recap, click the Transcript " +
+        "tab, wait for the transcript panel to finish loading, then try " +
+        "again."
+      );
+    }
+    return (
+      "Could not find transcript content. Open the Teams meeting recording " +
+      "in SharePoint Stream, click 'Transcript' to show the transcript " +
+      "panel, let it load, then try again."
+    );
   }
 
   // ---------------------------------------------------------------------------
