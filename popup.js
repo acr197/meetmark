@@ -255,18 +255,22 @@ document.addEventListener("DOMContentLoaded", () => {
   // PNG full-page screenshot flow
   // ---------------------------------------------------------------------------
   //
-  // Faithful port of mrcoles / GoFullPage. The popup drives the capture:
+  // Port of mrcoles / GoFullPage, extended to handle dashboards where the
+  // real scrolling is done by an inner <div> and not the window. The popup
+  // drives the capture:
   //
   //   1. Inject screenshot.js into the top frame.
   //   2. Open a long-lived port and tell it to start.
-  //   3. The content script scrolls through a grid of viewport positions
-  //      (bottom-up, left-to-right) and, for each, posts a `capture` message
-  //      containing the current scroll offset and the full document size.
+  //   3. The content script picks the scroll target (window or the biggest
+  //      scrollable descendant), then scrolls through a grid of viewport
+  //      positions (bottom-up, left-to-right). For each it posts a `capture`
+  //      message containing the current scroll offset, the full scrollable
+  //      size, and — when the target is an inner element — the container's
+  //      rect on the captured tab image so we can crop to it.
   //   4. For each `capture` we call chrome.tabs.captureVisibleTab, load the
-  //      PNG into an Image, and draw it into one (or more, for very tall
-  //      pages) offscreen canvases at the correct pixel offset, then ack
-  //      the content script with `captured` so it can scroll to the next
-  //      arrangement.
+  //      PNG into an Image, crop to the reported rect, and draw it into one
+  //      (or more, for very tall pages) offscreen canvases at the correct
+  //      pixel offset, then ack the content script with `captured`.
   //   5. On `done`, encode each canvas to a PNG data URL and hand it to the
   //      service worker to save via chrome.downloads.
   //
@@ -418,17 +422,64 @@ document.addEventListener("DOMContentLoaded", () => {
         screenshots = initScreenshots(pageWidthPx, pageHeightPx);
       }
 
-      // captureVisibleTab returns at device-pixel resolution; data.x / y are
-      // CSS scroll offsets. Convert to device px before drawing.
-      const xPx = Math.round(data.x * data.devicePixelRatio);
-      const yPx = Math.round(data.y * data.devicePixelRatio);
-      const imgRight = xPx + img.width;
-      const imgBottom = yPx + img.height;
+      // captureVisibleTab returns at device-pixel resolution. When the
+      // content script drove window.scrollTo the whole image is the content
+      // and data.src is null. When it drove an inner scroll container,
+      // data.src describes the container's rect on the tab image (CSS px)
+      // and we need to crop before stitching.
+      const dpr = data.devicePixelRatio || 1;
+
+      let srcX = 0;
+      let srcY = 0;
+      let srcW = img.width;
+      let srcH = img.height;
+      if (data.src) {
+        srcX = Math.max(0, Math.round(data.src.left * dpr));
+        srcY = Math.max(0, Math.round(data.src.top * dpr));
+        srcW = Math.max(0, Math.round(data.src.width * dpr));
+        srcH = Math.max(0, Math.round(data.src.height * dpr));
+        // Clamp to image bounds.
+        if (srcX >= img.width || srcY >= img.height) {
+          // Container is fully off-screen; nothing to draw.
+          if (typeof data.complete === "number") setProgress(data.complete);
+          try {
+            port.postMessage({ type: "captured" });
+          } catch (_) {}
+          return;
+        }
+        srcW = Math.min(srcW, img.width - srcX);
+        srcH = Math.min(srcH, img.height - srcY);
+      }
+
+      if (srcW <= 0 || srcH <= 0) {
+        if (typeof data.complete === "number") setProgress(data.complete);
+        try {
+          port.postMessage({ type: "captured" });
+        } catch (_) {}
+        return;
+      }
+
+      // Destination in the output canvas (device px). data.x / y are the
+      // scroll offset inside the container (or the window).
+      const dstX = Math.round(data.x * dpr);
+      const dstY = Math.round(data.y * dpr);
+      const dstRight = dstX + srcW;
+      const dstBottom = dstY + srcH;
 
       for (const s of screenshots) {
-        if (imgRight <= s.left || s.right <= xPx) continue;
-        if (imgBottom <= s.top || s.bottom <= yPx) continue;
-        s.ctx.drawImage(img, xPx - s.left, yPx - s.top);
+        if (dstRight <= s.left || s.right <= dstX) continue;
+        if (dstBottom <= s.top || s.bottom <= dstY) continue;
+        s.ctx.drawImage(
+          img,
+          srcX,
+          srcY,
+          srcW,
+          srcH,
+          dstX - s.left,
+          dstY - s.top,
+          srcW,
+          srcH
+        );
       }
 
       if (typeof data.complete === "number") {
