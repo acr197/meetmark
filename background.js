@@ -1,11 +1,25 @@
 // MeetMark service worker.
-// Listens for download requests from the popup, encodes the markdown body
-// into a data URL, and hands it to chrome.downloads.download. Using a data
-// URL (rather than URL.createObjectURL) keeps things working from inside a
-// service worker, where Blob URLs are not supported in MV3.
+//
+// Handles download requests from the popup. Three payload shapes are
+// supported:
+//
+//   1. { type: "MEETMARK_DOWNLOAD", filename, content, mime, format: "md" }
+//      — write a Markdown file.
+//   2. { type: "MEETMARK_DOWNLOAD", filename, content, mime, format: "txt" }
+//      — write a plain text file.
+//   3. { type: "MEETMARK_DOWNLOAD", filename, content, mime, format: "pdf" }
+//      — open the printable HTML in a new tab. The HTML auto-invokes
+//      window.print() once it loads, so the user lands in the browser's
+//      print dialog and can Save as PDF. No actual .pdf file is written
+//      directly — Chrome's native print-to-PDF does the conversion.
+//   4. { type: "MEETMARK_DOWNLOAD", filename, dataUrl, mime: "image/png",
+//        format: "png" }
+//      — write a PNG file already encoded as a data: URL by the popup.
+//
+// In all disk-write cases we hand the data: URL to chrome.downloads.download.
+// Data URLs work from an MV3 service worker where Blob URLs are not
+// supported.
 
-// Convert a UTF-8 string into a base64 string. Done by hand because btoa()
-// only handles Latin-1.
 function utf8ToBase64(str) {
   const bytes = new TextEncoder().encode(str);
   let binary = "";
@@ -17,25 +31,14 @@ function utf8ToBase64(str) {
   return btoa(binary);
 }
 
-// Build a data URL for a Markdown payload.
-function buildDataUrl(markdown) {
-  const b64 = utf8ToBase64(markdown);
-  return "data:text/markdown;charset=utf-8;base64," + b64;
+// Build a data URL for a UTF-8 text payload.
+function buildTextDataUrl(content, mime) {
+  const type = mime || "text/plain;charset=utf-8";
+  return "data:" + type + ";base64," + utf8ToBase64(content);
 }
 
-// Wire up the message listener. The popup posts a MEETMARK_DOWNLOAD message
-// containing the filename and markdown body, and we reply with { ok } or
-// { ok: false, error }.
-chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (!message || message.type !== "MEETMARK_DOWNLOAD") {
-    return false;
-  }
-
+function startDownload(url, filename, sendResponse) {
   try {
-    const filename = (message.filename || "transcript.md").toString();
-    const markdown = (message.markdown || "").toString();
-    const url = buildDataUrl(markdown);
-
     chrome.downloads.download(
       {
         url,
@@ -51,10 +54,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           return;
         }
         if (typeof downloadId !== "number") {
-          sendResponse({
-            ok: false,
-            error: "Download did not start.",
-          });
+          sendResponse({ ok: false, error: "Download did not start." });
           return;
         }
         sendResponse({ ok: true, downloadId });
@@ -66,7 +66,74 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       error: (err && err.message) || String(err),
     });
   }
+}
 
-  // Returning true keeps the message channel open for the async response.
+// Open the printable HTML in a new tab. We pass the HTML as a data URL so
+// the page runs at a sandbox-safe origin; it can still call window.print()
+// against its own window, which is all we need. The page's inline script
+// (injected by content.js's markdownToPrintableHtml) fires print() on load.
+function openPrintTab(html, sendResponse) {
+  try {
+    const dataUrl = "data:text/html;charset=utf-8;base64," + utf8ToBase64(html);
+    chrome.tabs.create({ url: dataUrl, active: true }, (tab) => {
+      if (chrome.runtime.lastError) {
+        sendResponse({
+          ok: false,
+          error: chrome.runtime.lastError.message,
+        });
+        return;
+      }
+      sendResponse({ ok: true, tabId: tab && tab.id });
+    });
+  } catch (err) {
+    sendResponse({
+      ok: false,
+      error: (err && err.message) || String(err),
+    });
+  }
+}
+
+chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (!message || message.type !== "MEETMARK_DOWNLOAD") {
+    return false;
+  }
+
+  try {
+    const filename = (message.filename || "transcript.md").toString();
+    const format = (message.format || "md").toString();
+
+    if (format === "pdf") {
+      // The "content" is printable HTML — hand it to a new tab for the
+      // user to Save as PDF from the print dialog.
+      const html = (message.content || "").toString();
+      openPrintTab(html, sendResponse);
+      return true;
+    }
+
+    if (format === "png") {
+      // The popup has already produced a full data: URL (data:image/png;
+      // base64,...) from a canvas. Hand it straight to downloads.
+      const url = (message.dataUrl || "").toString();
+      if (!url) {
+        sendResponse({ ok: false, error: "No PNG data URL supplied." });
+        return true;
+      }
+      startDownload(url, filename, sendResponse);
+      return true;
+    }
+
+    // Default: text (md or txt). Base64-encode through a data URL so the
+    // service worker can drive chrome.downloads without Blob support.
+    const content = (message.content || "").toString();
+    const mime = (message.mime || "text/markdown;charset=utf-8").toString();
+    const url = buildTextDataUrl(content, mime);
+    startDownload(url, filename, sendResponse);
+  } catch (err) {
+    sendResponse({
+      ok: false,
+      error: (err && err.message) || String(err),
+    });
+  }
+
   return true;
 });

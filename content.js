@@ -68,7 +68,12 @@
           ? msg.parentMetadata
           : null;
 
-      runExport(port, isCancelled, parentMetadata)
+      // format is one of "md" (default), "txt", or "pdf". The scrape is
+      // identical for all three — only the final serialization differs.
+      const format =
+        msg.format === "txt" || msg.format === "pdf" ? msg.format : "md";
+
+      runExport(port, isCancelled, parentMetadata, format)
         .then((result) => {
           if (cancelled) return;
           if (result.ok) {
@@ -76,7 +81,9 @@
               port.postMessage({
                 type: "done",
                 filename: result.filename,
-                markdown: result.markdown,
+                content: result.content,
+                mime: result.mime,
+                format: result.format,
                 warning: result.warning || null,
                 turnCount: result.turnCount || 0,
                 speakerCount: result.speakerCount || 0,
@@ -103,15 +110,19 @@
     });
   });
 
-  // Top-level orchestration. Returns { ok, markdown, filename, warning,
-  // turnCount, speakerCount } or { ok: false, error }.
+  // Top-level orchestration. Returns { ok, content, mime, format, filename,
+  // warning, turnCount, speakerCount } or { ok: false, error }.
   //
   // parentMetadata is the { title, dateIso, url } the popup probed from the
   // top frame before starting the export. It's only supplied when the scrape
   // is happening inside a child frame (e.g. the Teams Recap xplat iframe),
   // because none of the Teams page chrome — meeting title, date, the user-
   // facing URL — is reachable from inside that cross-origin iframe.
-  async function runExport(port, isCancelled, parentMetadata) {
+  //
+  // format is "md" (default), "txt", or "pdf". The scrape is identical for
+  // all three — we render the same merged transcript into a different output
+  // representation at the end.
+  async function runExport(port, isCancelled, parentMetadata, format) {
     function progress(message, detail) {
       if (!port) return;
       try {
@@ -212,16 +223,153 @@
       parentMetadata
     );
     const markdown = formatMarkdown(mergedTurns, participants, metadata);
-    const filename = buildFilename(metadata);
+    const baseName = buildBaseFilename(metadata);
+
+    // Re-render the markdown into the chosen output format. The scrape is
+    // identical for every format; only this final step differs.
+    const chosenFormat = format || "md";
+    let content;
+    let mime;
+    let filename;
+    if (chosenFormat === "txt") {
+      content = markdownToPlainText(markdown);
+      mime = "text/plain;charset=utf-8";
+      filename = baseName + ".txt";
+    } else if (chosenFormat === "pdf") {
+      content = markdownToPrintableHtml(markdown, metadata, baseName);
+      mime = "text/html;charset=utf-8";
+      filename = baseName + ".pdf";
+    } else {
+      content = markdown;
+      mime = "text/markdown;charset=utf-8";
+      filename = baseName + ".md";
+    }
 
     return {
       ok: true,
-      markdown,
+      content,
+      mime,
+      format: chosenFormat,
       filename,
       warning,
       turnCount: mergedTurns.length,
       speakerCount: participants.length,
     };
+  }
+
+  // Convert the Markdown transcript into plain text. The markdown we emit is
+  // predictable (we built it ourselves), so we only need to strip the markers
+  // we actually use: ATX headings, bold (**...**), italics (*...*),
+  // hr fences (--- on their own line), and inline code (`...`).
+  function markdownToPlainText(md) {
+    return md
+      .split("\n")
+      .map((line) => {
+        let l = line;
+        if (/^\s*---\s*$/.test(l)) return "";
+        l = l.replace(/^#{1,6}\s*/, "");
+        l = l.replace(/\*\*(.+?)\*\*/g, "$1");
+        l = l.replace(/(^|[^*])\*(?!\s)([^*]+?)\*(?!\*)/g, "$1$2");
+        l = l.replace(/`([^`]+)`/g, "$1");
+        l = l.replace(/\s{2,}$/, "");
+        return l;
+      })
+      .join("\n")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim() + "\n";
+  }
+
+  // Wrap the Markdown transcript in a printable HTML shell. The popup opens
+  // this in a new tab; the page auto-invokes window.print() on load so the
+  // user lands directly in the browser's print dialog, where "Save as PDF"
+  // is the default destination in Chrome and Firefox.
+  function markdownToPrintableHtml(md, metadata, baseName) {
+    const title = (metadata && metadata.title) || "Meeting Transcript";
+
+    // Very small Markdown → HTML pass. We only handle the constructs
+    // formatMarkdown() actually produces: ATX headings, bold, italics,
+    // horizontal rules, and plain paragraphs.
+    const bodyLines = [];
+    const paragraph = [];
+    function flush() {
+      if (!paragraph.length) return;
+      const joined = paragraph.join("<br>");
+      bodyLines.push("<p>" + joined + "</p>");
+      paragraph.length = 0;
+    }
+
+    const lines = md.split("\n");
+    for (const raw of lines) {
+      const line = raw.replace(/\s+$/, "");
+      if (!line.length) {
+        flush();
+        continue;
+      }
+      if (/^---\s*$/.test(line)) {
+        flush();
+        bodyLines.push("<hr>");
+        continue;
+      }
+      const heading = line.match(/^(#{1,6})\s+(.*)$/);
+      if (heading) {
+        flush();
+        const level = heading[1].length;
+        bodyLines.push(
+          "<h" + level + ">" + inlineMdToHtml(heading[2]) + "</h" + level + ">"
+        );
+        continue;
+      }
+      paragraph.push(inlineMdToHtml(line));
+    }
+    flush();
+
+    const css =
+      "@page { margin: 0.75in; }" +
+      "body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; color: #1f1f1f; font-size: 12pt; line-height: 1.5; max-width: 7.5in; margin: 0 auto; padding: 24px; }" +
+      "h1 { font-size: 20pt; margin: 0 0 12px; }" +
+      "h2 { font-size: 14pt; margin: 18px 0 8px; }" +
+      "h3 { font-size: 12pt; margin: 14px 0 6px; }" +
+      "hr { border: none; border-top: 1px solid #c8cad9; margin: 16px 0; }" +
+      "p { margin: 0 0 10px; }" +
+      ".footer-note { color: #5f6368; font-size: 10pt; font-style: italic; }";
+
+    // Auto-trigger the print dialog after the page lays out. Setting
+    // document.title controls the default filename Chrome suggests in the
+    // Save as PDF dialog.
+    const autoPrint =
+      "try { document.title = " +
+      JSON.stringify(baseName) +
+      "; } catch(_) {} " +
+      "window.addEventListener('load', function(){ setTimeout(function(){ try { window.print(); } catch(_) {} }, 150); });";
+
+    return (
+      "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>" +
+      escapeHtml(title) +
+      "</title><style>" +
+      css +
+      "</style></head><body>" +
+      bodyLines.join("\n") +
+      "<script>" +
+      autoPrint +
+      "</" +
+      "script></body></html>"
+    );
+  }
+
+  function inlineMdToHtml(s) {
+    let out = escapeHtml(s);
+    out = out.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+    out = out.replace(/(^|[^*])\*(?!\s)([^*]+?)\*(?!\*)/g, "$1<em>$2</em>");
+    out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
+    return out;
+  }
+
+  function escapeHtml(s) {
+    return String(s)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
   }
 
   // Build the error message shown when no transcript container can be found
@@ -1831,16 +1979,16 @@
   // Filename
   // ---------------------------------------------------------------------------
 
-  // Build a download filename in the format
-  //   "YYYY.MM.DD - {Meeting Title} Transcript.md"
-  // using the title and date extracted from the page, with safe fallbacks.
-  function buildFilename(metadata) {
+  // Build the extension-less base of the download filename in the format
+  //   "YYYY.MM.DD - {Meeting Title} Transcript"
+  // The caller appends the appropriate extension (.md / .txt / .pdf).
+  function buildBaseFilename(metadata) {
     const datePart = formatDateDotted(metadata.date || new Date());
     const titlePart = sanitizeFilename(metadata.title || "");
     if (titlePart) {
-      return datePart + " - " + titlePart + " Transcript.md";
+      return datePart + " - " + titlePart + " Transcript";
     }
-    return datePart + " - Transcript.md";
+    return datePart + " - Transcript";
   }
 
   // Replace characters that aren't safe in filenames on common OSes.

@@ -1,18 +1,38 @@
 // MeetMark popup controller.
-// The export starts automatically when the popup opens. The Cancel button
-// aborts immediately and closes the popup. The Export button retries after
-// a completed or failed run.
+//
+// The popup exposes three export paths:
+//
+//   1. Quick Grab MD            — one-click transcript export as Markdown,
+//                                 the historical default behavior.
+//   2. Grab as (MD / TXT / PDF) — same transcript pipeline as Quick Grab,
+//                                 but the content is re-rendered in the
+//                                 chosen format before download. PDF opens
+//                                 a printable HTML tab so the user can Save
+//                                 as PDF from the browser print dialog.
+//   3. Capture full page as PNG — full-page screenshot of the current tab
+//                                 by scrolling the page, calling
+//                                 chrome.tabs.captureVisibleTab() at each
+//                                 arrangement, and stitching the captures
+//                                 into one PNG. Inspired by Peter Coles'
+//                                 full-page-screen-capture-chrome-extension.
+//                                 Works on any tab (relies on activeTab),
+//                                 not just Teams.
 
 document.addEventListener("DOMContentLoaded", () => {
-  const exportBtn = document.getElementById("exportBtn");
+  const quickBtn = document.getElementById("quickBtn");
+  const grabBtn = document.getElementById("grabBtn");
+  const pngBtn = document.getElementById("pngBtn");
+  const formatSelect = document.getElementById("formatSelect");
   const cancelBtn = document.getElementById("cancelBtn");
   const status = document.getElementById("status");
   const detail = document.getElementById("detail");
   const progressBar = document.getElementById("progressBar");
+  const progressFill = progressBar.querySelector(".fill");
 
-  let port = null;
-  let tabId = null;
-  let targetFrameId = 0;
+  // Exactly one of these is active at a time. The cancel button talks to
+  // whichever is set.
+  let activePort = null;
+  let activeCancel = null;
 
   function setStatus(message, level) {
     status.textContent = message || "";
@@ -23,17 +43,36 @@ document.addEventListener("DOMContentLoaded", () => {
     detail.textContent = text || "";
   }
 
-  function setBusy(busy) {
-    exportBtn.disabled = busy;
+  function setBusy(busy, determinate) {
+    quickBtn.disabled = busy;
+    grabBtn.disabled = busy;
+    pngBtn.disabled = busy;
+    formatSelect.disabled = busy;
     cancelBtn.disabled = !busy;
     if (busy) {
       progressBar.classList.add("active");
+      if (determinate) {
+        progressBar.classList.add("determinate");
+        progressFill.style.width = "0%";
+      } else {
+        progressBar.classList.remove("determinate");
+        progressFill.style.width = "";
+      }
     } else {
       progressBar.classList.remove("active");
+      progressBar.classList.remove("determinate");
+      progressFill.style.width = "";
     }
   }
 
-  function isSupportedUrl(url) {
+  function setProgress(fraction) {
+    if (typeof fraction !== "number" || !isFinite(fraction)) return;
+    const pct = Math.max(0, Math.min(1, fraction)) * 100;
+    progressFill.style.width = pct.toFixed(1) + "%";
+  }
+
+  // Teams / SharePoint URL gate — only applied to the transcript flows.
+  function isTranscriptUrl(url) {
     if (!url) return false;
     try {
       const u = new URL(url);
@@ -52,25 +91,43 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
-  // Tear down the port and reset the UI to idle (export button re-enabled).
+  // Reject tabs we cannot script or capture (chrome:// pages, extension
+  // pages, the Chrome Web Store, view-source:, etc). Used by the PNG flow.
+  function isCapturableUrl(url) {
+    if (!url) return false;
+    try {
+      const u = new URL(url);
+      if (u.protocol !== "http:" && u.protocol !== "https:" && u.protocol !== "file:") {
+        return false;
+      }
+      if (u.hostname === "chrome.google.com") return false;
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
   function closePort() {
-    if (port) {
+    if (activePort) {
       try {
-        port.disconnect();
+        activePort.disconnect();
       } catch (_) {
         /* ignore */
       }
-      port = null;
+      activePort = null;
     }
+    activeCancel = null;
     setBusy(false);
   }
 
-  // Start or re-run the export. Called automatically on open and by the
-  // Export button when retrying after a completed or failed run.
-  async function startExport() {
+  // ---------------------------------------------------------------------------
+  // Transcript flows (Quick Grab + Grab as MD/TXT/PDF)
+  // ---------------------------------------------------------------------------
+
+  async function startTranscriptExport(format) {
     setStatus("Starting...", "info");
     setDetail("");
-    setBusy(true);
+    setBusy(true, false);
 
     try {
       const [tab] = await chrome.tabs.query({
@@ -84,50 +141,39 @@ document.addEventListener("DOMContentLoaded", () => {
         return;
       }
 
-      if (!isSupportedUrl(tab.url)) {
+      if (!isTranscriptUrl(tab.url)) {
         setStatus(
-          "Open a Teams or SharePoint Stream recording page, then click Export again.",
+          "Open a Teams or SharePoint Stream recording page, then try again.",
           "error"
         );
         setBusy(false);
         return;
       }
 
-      tabId = tab.id;
-
-      // Inject the content script into every frame of the tab. On a
-      // SharePoint Stream page the transcript lives in the top frame, but on
-      // the teams.microsoft.com Calendar / Recap view the transcript is
-      // rendered inside a cross-origin SharePoint iframe (xplatIframe). We
-      // need the content script running in whichever frame owns the DOM.
+      // Inject the content script into every frame so we can scrape either
+      // the top SharePoint Stream frame or the Teams Recap xplat iframe.
       await chrome.scripting.executeScript({
         target: { tabId: tab.id, allFrames: true },
         files: ["content.js"],
       });
 
-      // Probe every frame to find which one actually hosts the transcript.
-      // Prefer a frame that already has transcript list cells rendered, then
-      // one that has transcript panel hooks, then fall back to a SharePoint
-      // iframe under a teams.microsoft.com parent, and finally the top frame.
-      targetFrameId = await pickTranscriptFrame(tab.id);
-
-      // When the scrape is happening inside a child frame, the Teams page
-      // chrome — meeting title, date, page URL — lives in the top frame and
-      // isn't reachable from the scraping frame. Probe the top frame for
-      // those values so the content script can use them when formatting the
-      // filename and the Markdown header.
+      const targetFrameId = await pickTranscriptFrame(tab.id);
       const parentMetadata =
         targetFrameId !== 0 ? await probeParentMetadata(tab.id) : null;
 
-      // Open a long-lived Port to the content script in the chosen frame so
-      // we can stream progress and send cancel.
-      port = chrome.tabs.connect(tab.id, {
+      const port = chrome.tabs.connect(tab.id, {
         name: "meetmark",
         frameId: targetFrameId,
       });
+      activePort = port;
+      activeCancel = () => {
+        try {
+          port.postMessage({ type: "cancel" });
+        } catch (_) {}
+      };
 
       port.onDisconnect.addListener(() => {
-        port = null;
+        if (activePort === port) activePort = null;
       });
 
       port.onMessage.addListener((msg) => {
@@ -141,7 +187,7 @@ document.addEventListener("DOMContentLoaded", () => {
             setStatus(msg.message || "Warning", "warn");
             break;
           case "done":
-            handleDone(msg);
+            handleTranscriptDone(msg);
             break;
           case "error":
             setStatus(msg.message || "Export failed.", "error");
@@ -153,7 +199,7 @@ document.addEventListener("DOMContentLoaded", () => {
         }
       });
 
-      port.postMessage({ type: "start", parentMetadata });
+      port.postMessage({ type: "start", format, parentMetadata });
       setStatus("Reading transcript...", "info");
     } catch (err) {
       setStatus(
@@ -164,40 +210,27 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
-  // Export / retry button.
-  exportBtn.addEventListener("click", () => startExport());
-
-  // Cancel: signal the content script, disconnect immediately, and close the
-  // popup so the user isn't left staring at a frozen UI.
-  cancelBtn.addEventListener("click", () => {
-    if (port) {
-      try {
-        port.postMessage({ type: "cancel" });
-      } catch (_) {
-        /* ignore */
-      }
-    }
-    closePort();
-    window.close();
-  });
-
-  // Handle a "done" message: push markdown to the service worker for
-  // download, then update status.
-  async function handleDone(msg) {
+  async function handleTranscriptDone(msg) {
     setStatus("Converting and downloading...", "info");
     setDetail("");
     try {
       const downloadResult = await chrome.runtime.sendMessage({
         type: "MEETMARK_DOWNLOAD",
         filename: msg.filename,
-        markdown: msg.markdown,
+        content: msg.content,
+        mime: msg.mime,
+        format: msg.format,
       });
 
       if (downloadResult && downloadResult.ok) {
+        const what =
+          msg.format === "pdf"
+            ? "Opened print-to-PDF view: " + msg.filename
+            : "Done. Downloaded as " + msg.filename;
         if (msg.warning) {
           setStatus("Exported with warning: " + msg.warning, "warn");
         } else {
-          setStatus("Done. Downloaded as " + msg.filename, "success");
+          setStatus(what, "success");
         }
         setDetail(
           (msg.turnCount ? msg.turnCount + " turns exported" : "") +
@@ -222,15 +255,354 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }
 
-  // Probe every frame in the tab and decide which one the content script
-  // should scrape. Returns a frameId (0 = top). The heuristic, in order:
-  //   1. A frame whose DOM already contains Stream transcript ListCells.
-  //   2. A frame that has Teams/Stream transcript hooks (aria-label,
-  //      data-tid="Transcript", data-automationid*="transcript").
-  //   3. If the top frame is on teams.microsoft.com, the first child frame
-  //      on *.sharepoint.com — the Teams Recap xplat iframe loads from
-  //      SharePoint and is where the transcript DOM actually lives.
-  //   4. The top frame.
+  // ---------------------------------------------------------------------------
+  // PNG full-page screenshot flow
+  // ---------------------------------------------------------------------------
+  //
+  // The popup owns the chrome.tabs.captureVisibleTab calls and the canvas
+  // stitching. A content script (screenshot.js) injected into the top frame
+  // owns the scroll loop — it tells us which (x, y) to capture at each step
+  // and waits for our acknowledgement before scrolling to the next.
+  //
+  // Chrome throttles captureVisibleTab to ~2/second; screenshot.js already
+  // waits CAPTURE_DELAY between scrolls, but we also rate-limit here by
+  // awaiting each capture before replying.
+
+  async function startScreenshot() {
+    setStatus("Starting screenshot...", "info");
+    setDetail("");
+    setBusy(true, true);
+    setProgress(0);
+
+    let tab;
+    try {
+      [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    } catch (err) {
+      setStatus(
+        "Error: " + (err && err.message ? err.message : String(err)),
+        "error"
+      );
+      setBusy(false);
+      return;
+    }
+
+    if (!tab || !tab.id) {
+      setStatus("No active tab found.", "error");
+      setBusy(false);
+      return;
+    }
+
+    if (!isCapturableUrl(tab.url)) {
+      setStatus(
+        "This page can't be captured (chrome:// pages, the Chrome Web Store, and extension pages are blocked by the browser).",
+        "error"
+      );
+      setBusy(false);
+      return;
+    }
+
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id, frameIds: [0] },
+        files: ["screenshot.js"],
+      });
+    } catch (err) {
+      setStatus(
+        "Could not attach to page: " +
+          (err && err.message ? err.message : String(err)),
+        "error"
+      );
+      setBusy(false);
+      return;
+    }
+
+    // Canvas(es) we stitch captures into. Lazily created once we know the
+    // page's full dimensions and the devicePixelRatio scale from the first
+    // captured image.
+    let screenshots = [];
+    let lastCaptureError = null;
+
+    const port = chrome.tabs.connect(tab.id, {
+      name: "meetmark-shot",
+      frameId: 0,
+    });
+    activePort = port;
+    activeCancel = () => {
+      try {
+        port.postMessage({ type: "cancel" });
+      } catch (_) {}
+    };
+
+    port.onDisconnect.addListener(() => {
+      if (activePort === port) activePort = null;
+    });
+
+    port.onMessage.addListener(async (msg) => {
+      if (!msg || !msg.type) return;
+      try {
+        if (msg.type === "capture") {
+          await handleCaptureAt(msg, screenshots, tab.id);
+          setProgress(msg.complete || 0);
+          try {
+            port.postMessage({ type: "captured" });
+          } catch (_) {}
+        } else if (msg.type === "done") {
+          await finishScreenshot(screenshots, tab);
+        } else if (msg.type === "error") {
+          setStatus(msg.message || "Screenshot failed.", "error");
+          closePort();
+        } else if (msg.type === "progress") {
+          setStatus(msg.message || "Working...", "info");
+        }
+      } catch (err) {
+        lastCaptureError = err;
+        setStatus(
+          "Screenshot error: " +
+            (err && err.message ? err.message : String(err)),
+          "error"
+        );
+        try {
+          port.postMessage({ type: "cancel" });
+        } catch (_) {}
+        closePort();
+      }
+    });
+
+    setStatus("Measuring page...", "info");
+    port.postMessage({ type: "start" });
+
+    // If screenshot.js never responds (e.g. a weird CSP blocks injection),
+    // the port will idle indefinitely. Give up after 30 s with no messages.
+    // (Each capture resets the timer via the message listener above — we
+    // don't wire that up for simplicity; the overall 30 s is a backstop.)
+    setTimeout(() => {
+      if (activePort === port && !lastCaptureError) {
+        // Still running — don't cancel. This handler is only for the case
+        // where screenshot.js never sent the first message. Best-effort
+        // heuristic: if no captures happened yet, bail.
+        if (screenshots.length === 0) {
+          setStatus("Page did not respond. Try reloading and retrying.", "error");
+          try {
+            port.postMessage({ type: "cancel" });
+          } catch (_) {}
+          closePort();
+        }
+      }
+    }, 30000);
+  }
+
+  // Draw one viewport capture into the appropriate stitched canvas(es).
+  async function handleCaptureAt(info, screenshots, tabId) {
+    // We call captureVisibleTab without a windowId — it captures the active
+    // tab of the current window, which is the tab under the popup.
+    const dataUrl = await chrome.tabs.captureVisibleTab(null, {
+      format: "png",
+    });
+    if (!dataUrl) {
+      throw new Error("captureVisibleTab returned no data. The browser may have throttled the capture.");
+    }
+
+    const image = await loadImage(dataUrl);
+
+    // On high-DPI displays captureVisibleTab returns a larger image than the
+    // logical window size. Scale the stitching math to match.
+    let x = info.x;
+    let y = info.y;
+    let totalWidth = info.totalWidth;
+    let totalHeight = info.totalHeight;
+    if (info.windowWidth && info.windowWidth !== image.width) {
+      const scale = image.width / info.windowWidth;
+      x *= scale;
+      y *= scale;
+      totalWidth *= scale;
+      totalHeight *= scale;
+    }
+
+    // Lazily init the canvas(es) once we know the real pixel dimensions.
+    if (!screenshots.length) {
+      initScreenshots(totalWidth, totalHeight).forEach((s) =>
+        screenshots.push(s)
+      );
+    }
+
+    // Draw into every canvas whose rect intersects this capture's rect.
+    const imgRight = x + image.width;
+    const imgBottom = y + image.height;
+    for (const s of screenshots) {
+      if (
+        x < s.right &&
+        imgRight > s.left &&
+        y < s.bottom &&
+        imgBottom > s.top
+      ) {
+        s.ctx.drawImage(image, x - s.left, y - s.top);
+      }
+    }
+  }
+
+  // Max canvas dimension Chrome will reliably encode to PNG. Matches
+  // mrcoles' full-page-screen-capture constants.
+  const MAX_PRIMARY = 15000 * 2;
+  const MAX_SECONDARY = 4000 * 2;
+  const MAX_AREA = MAX_PRIMARY * MAX_SECONDARY;
+
+  // If the stitched image is bigger than the browser can safely encode to
+  // PNG, break it up into tiles. Returns an array of { canvas, ctx, left,
+  // top, right, bottom }.
+  function initScreenshots(totalWidth, totalHeight) {
+    const tooBig =
+      totalHeight > MAX_PRIMARY ||
+      totalWidth > MAX_PRIMARY ||
+      totalHeight * totalWidth > MAX_AREA;
+    const biggerWidth = totalWidth > totalHeight;
+    const maxWidth = !tooBig
+      ? totalWidth
+      : biggerWidth
+      ? MAX_PRIMARY
+      : MAX_SECONDARY;
+    const maxHeight = !tooBig
+      ? totalHeight
+      : biggerWidth
+      ? MAX_SECONDARY
+      : MAX_PRIMARY;
+    const numCols = Math.max(1, Math.ceil(totalWidth / maxWidth));
+    const numRows = Math.max(1, Math.ceil(totalHeight / maxHeight));
+
+    const result = [];
+    for (let row = 0; row < numRows; row++) {
+      for (let col = 0; col < numCols; col++) {
+        const canvas = document.createElement("canvas");
+        canvas.width =
+          col === numCols - 1 ? totalWidth - col * maxWidth : maxWidth;
+        canvas.height =
+          row === numRows - 1 ? totalHeight - row * maxHeight : maxHeight;
+        const left = col * maxWidth;
+        const top = row * maxHeight;
+        result.push({
+          canvas,
+          ctx: canvas.getContext("2d"),
+          left,
+          top,
+          right: left + canvas.width,
+          bottom: top + canvas.height,
+        });
+      }
+    }
+    return result;
+  }
+
+  function loadImage(dataUrl) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = () =>
+        reject(new Error("Could not decode captured viewport image."));
+      img.src = dataUrl;
+    });
+  }
+
+  async function finishScreenshot(screenshots, tab) {
+    if (!screenshots.length) {
+      setStatus("Nothing to save — no viewport captures collected.", "error");
+      closePort();
+      return;
+    }
+
+    setStatus("Encoding PNG...", "info");
+    setProgress(1);
+
+    const baseName = buildScreenshotFilename(tab.url);
+    let downloaded = 0;
+    const total = screenshots.length;
+
+    for (let i = 0; i < screenshots.length; i++) {
+      const suffix = total > 1 ? "-" + (i + 1) : "";
+      const filename = baseName + suffix + ".png";
+      const dataUrl = screenshots[i].canvas.toDataURL("image/png");
+
+      const result = await chrome.runtime.sendMessage({
+        type: "MEETMARK_DOWNLOAD",
+        filename,
+        dataUrl,
+        mime: "image/png",
+        format: "png",
+      });
+
+      if (result && result.ok) {
+        downloaded++;
+      } else {
+        setStatus(
+          "Download failed: " +
+            ((result && result.error) || "unknown error"),
+          "error"
+        );
+        closePort();
+        return;
+      }
+    }
+
+    if (total > 1) {
+      setStatus(
+        "Done. Page was too tall for a single image — saved " +
+          total +
+          " PNG tiles.",
+        "success"
+      );
+    } else {
+      setStatus("Done. Saved full-page PNG (" + downloaded + " file).", "success");
+    }
+    setDetail("");
+    closePort();
+  }
+
+  function buildScreenshotFilename(url) {
+    let base = "screenshot";
+    try {
+      const u = new URL(url);
+      base =
+        (u.hostname + u.pathname)
+          .replace(/[\\/:*?"<>|]/g, "_")
+          .replace(/_+$/g, "")
+          .slice(0, 80) || "screenshot";
+    } catch (_) {}
+    const d = new Date();
+    const stamp =
+      d.getFullYear() +
+      "." +
+      String(d.getMonth() + 1).padStart(2, "0") +
+      "." +
+      String(d.getDate()).padStart(2, "0") +
+      "-" +
+      String(d.getHours()).padStart(2, "0") +
+      String(d.getMinutes()).padStart(2, "0") +
+      String(d.getSeconds()).padStart(2, "0");
+    return stamp + " - " + base;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Button wiring
+  // ---------------------------------------------------------------------------
+
+  quickBtn.addEventListener("click", () => startTranscriptExport("md"));
+  grabBtn.addEventListener("click", () =>
+    startTranscriptExport(formatSelect.value || "md")
+  );
+  pngBtn.addEventListener("click", () => startScreenshot());
+
+  cancelBtn.addEventListener("click", () => {
+    if (activeCancel) {
+      try {
+        activeCancel();
+      } catch (_) {}
+    }
+    closePort();
+    window.close();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Helpers for frame selection (unchanged from the prior single-purpose flow)
+  // ---------------------------------------------------------------------------
+
   async function pickTranscriptFrame(tid) {
     let probes;
     try {
@@ -288,10 +660,6 @@ document.addEventListener("DOMContentLoaded", () => {
     return 0;
   }
 
-  // Probe the top frame for the meeting title, date, and URL. Used when the
-  // scrape is happening inside a cross-origin child frame (the Teams Recap
-  // xplat iframe) because that frame can't see the Teams page chrome where
-  // these values live. Returns { title, dateIso, url } or null on failure.
   async function probeParentMetadata(tid) {
     try {
       const results = await chrome.scripting.executeScript({
@@ -368,7 +736,4 @@ document.addEventListener("DOMContentLoaded", () => {
       return null;
     }
   }
-
-  // Begin exporting as soon as the popup opens — no button click required.
-  startExport();
 });

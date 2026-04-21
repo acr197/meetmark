@@ -25,12 +25,7 @@
       margin: 0 0 12px 0;
       color: #5f6368;
     }
-    .buttonRow {
-      display: flex;
-      gap: 8px;
-    }
     button {
-      flex: 1;
       padding: 10px 12px;
       font-size: 13px;
       font-weight: 600;
@@ -41,6 +36,7 @@
     button.primary {
       background: #4b53bc;
       color: #ffffff;
+      width: 100%;
     }
     button.primary:hover {
       background: #3f46a5;
@@ -61,6 +57,51 @@
       color: #c2c5d9;
       border-color: #c2c5d9;
       cursor: not-allowed;
+    }
+    .quick {
+      margin-bottom: 14px;
+    }
+    .sectionLabel {
+      font-size: 10px;
+      color: #5f6368;
+      margin: 0 0 4px 2px;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      font-weight: 600;
+    }
+    .row {
+      display: flex;
+      gap: 8px;
+      align-items: stretch;
+    }
+    .row select {
+      flex: 1;
+      padding: 9px 8px;
+      border-radius: 6px;
+      border: 1px solid #c8cad9;
+      font-size: 13px;
+      background: #ffffff;
+      color: #1f1f1f;
+    }
+    .row button {
+      padding: 9px 14px;
+      white-space: nowrap;
+    }
+    .divider {
+      text-align: center;
+      font-size: 10px;
+      color: #9aa0a6;
+      margin: 14px 0 10px;
+      letter-spacing: 0.6px;
+    }
+    .png button {
+      width: 100%;
+    }
+    .cancelRow {
+      margin-top: 12px;
+    }
+    .cancelRow button {
+      width: 100%;
     }
     .status {
       margin-top: 14px;
@@ -91,6 +132,10 @@
       border-radius: 2px;
       animation: slide 1.4s ease-in-out infinite;
     }
+    .progressBar.determinate .fill {
+      animation: none;
+      transition: width 0.15s linear;
+    }
     @keyframes slide {
       0%   { transform: translateX(-100%); }
       50%  { transform: translateX(100%); }
@@ -105,14 +150,35 @@
 </head>
 <body>
   <h1>MeetMark</h1>
-  <p class="sub">Export the current Teams transcript as Markdown.</p>
-  <div class="buttonRow">
-    <button id="exportBtn" class="primary" disabled>Export again</button>
-    <button id="cancelBtn" class="secondary">Cancel</button>
+  <p class="sub">Export the transcript or capture the full page.</p>
+
+  <div class="quick">
+    <button id="quickBtn" class="primary">Quick Grab MD</button>
   </div>
+
+  <div class="sectionLabel">Grab as</div>
+  <div class="row">
+    <select id="formatSelect" aria-label="Export format">
+      <option value="md">Markdown (.md)</option>
+      <option value="txt">Plain text (.txt)</option>
+      <option value="pdf">PDF (.pdf)</option>
+    </select>
+    <button id="grabBtn" class="secondary">Grab</button>
+  </div>
+
+  <div class="divider">— or —</div>
+
+  <div class="png">
+    <button id="pngBtn" class="secondary">Capture full page as PNG</button>
+  </div>
+
   <div class="progressBar" id="progressBar"><div class="fill"></div></div>
   <div id="status" class="status info"></div>
   <div id="detail" class="detail"></div>
+
+  <div class="cancelRow">
+    <button id="cancelBtn" class="secondary" disabled>Cancel</button>
+  </div>
   <script src="popup.js"></script>
 </body>
 </html>
