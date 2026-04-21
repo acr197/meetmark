@@ -1,10 +1,16 @@
 # MeetMark
-Chrome and Firefox extension that converts Microsoft Teams meeting transcripts to clean Markdown files ready for AI ingestion.
+Chrome and Firefox extension that converts Microsoft Teams meeting transcripts to clean Markdown / plain text / PDF, and can also capture any page as a single full-page PNG.
 
 [30s Demo](https://youtu.be/ZLr_SPXFyQY) (Sensitive data censored)
 
 ## What It Does
-Opens directly on any Teams recording page in SharePoint Stream. Click the extension icon and the transcript is read immediately — no extra steps. A progress popup shows live status with the option to cancel or re-export. Output is a structured Markdown file with metadata, speaker blocks, and full dialogue, formatted for use with custom GPTs, RAG pipelines, or any LLM that ingests documents.
+Clicking the toolbar icon opens a small menu with three paths:
+
+- **Quick Grab MD** — one click and the current Teams / SharePoint Stream transcript is exported as Markdown, exactly like earlier versions of MeetMark.
+- **Grab as…** — the same transcript pipeline, but pick the output format: Markdown (`.md`), plain text (`.txt`), or PDF (opens a printable view and jumps to the browser's Save-as-PDF dialog).
+- **Capture full page as PNG** — works on any page. The extension scrolls the current tab top to bottom, captures each viewport via `chrome.tabs.captureVisibleTab`, stitches the captures into a single tall PNG, and downloads it. Modeled after Peter Coles' [full-page-screen-capture-chrome-extension](https://github.com/mrcoles/full-page-screen-capture-chrome-extension).
+
+All processing runs locally — no network calls, no external APIs, no telemetry.
 
 ## Stack
 JavaScript, WebExtensions API (Chrome MV3 / Firefox MV3), SharePoint Stream DOM, Markdown
@@ -33,11 +39,19 @@ JavaScript, WebExtensions API (Chrome MV3 / Firefox MV3), SharePoint Stream DOM,
 For permanent Firefox installation, submit via [addons.mozilla.org](https://addons.mozilla.org).
 
 ## Usage
+
+### Transcript export (MD / TXT / PDF)
 1. Navigate to a Teams meeting recording in SharePoint Stream
 2. Open the Transcript panel (click **Transcript** in the video sidebar if it isn't already visible)
-3. Click the MeetMark toolbar icon — export starts automatically
-4. A progress popup appears; click **Cancel** to abort (closes the popup immediately), or wait for the download to complete
-5. Click **Export again** to re-export without closing the popup
+3. Click the MeetMark toolbar icon
+4. Either click **Quick Grab MD** for the historical one-click Markdown export, or pick **Markdown / Plain text / PDF** from the **Grab as** dropdown and click **Grab**
+5. PDF opens a printable view and launches the browser print dialog; choose **Save as PDF** to write the file
+
+### Full-page screenshot (PNG)
+1. Open the page you want to capture — this works on any site, not just Teams
+2. Click the MeetMark toolbar icon
+3. Click **Capture full page as PNG**. The extension briefly scrolls the page while capturing each viewport, then stitches the result into a single tall PNG and downloads it
+4. If the stitched image exceeds the browser's maximum canvas size, MeetMark falls back to multiple tiled PNGs (`<name>-1.png`, `<name>-2.png`, …)
 
 ## Privacy
 MeetMark runs entirely in your browser. It does not send transcript content to any server, does not call any external API, and has no analytics or telemetry. The only permission that touches the network is `downloads`, which is used solely to save the generated Markdown file to your local disk.
