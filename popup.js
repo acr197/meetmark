@@ -111,6 +111,14 @@ document.addEventListener("DOMContentLoaded", () => {
       // iframe under a teams.microsoft.com parent, and finally the top frame.
       targetFrameId = await pickTranscriptFrame(tab.id);
 
+      // When the scrape is happening inside a child frame, the Teams page
+      // chrome — meeting title, date, page URL — lives in the top frame and
+      // isn't reachable from the scraping frame. Probe the top frame for
+      // those values so the content script can use them when formatting the
+      // filename and the Markdown header.
+      const parentMetadata =
+        targetFrameId !== 0 ? await probeParentMetadata(tab.id) : null;
+
       // Open a long-lived Port to the content script in the chosen frame so
       // we can stream progress and send cancel.
       port = chrome.tabs.connect(tab.id, {
@@ -145,7 +153,7 @@ document.addEventListener("DOMContentLoaded", () => {
         }
       });
 
-      port.postMessage({ type: "start" });
+      port.postMessage({ type: "start", parentMetadata });
       setStatus("Reading transcript...", "info");
     } catch (err) {
       setStatus(
@@ -278,6 +286,87 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     return 0;
+  }
+
+  // Probe the top frame for the meeting title, date, and URL. Used when the
+  // scrape is happening inside a cross-origin child frame (the Teams Recap
+  // xplat iframe) because that frame can't see the Teams page chrome where
+  // these values live. Returns { title, dateIso, url } or null on failure.
+  async function probeParentMetadata(tid) {
+    try {
+      const results = await chrome.scripting.executeScript({
+        target: { tabId: tid, frameIds: [0] },
+        func: () => {
+          function stripTitleNoise(t) {
+            if (!t) return "";
+            let out = t;
+            out = out.replace(
+              /\s*[|\-]\s*(Microsoft Teams|Microsoft Stream|SharePoint|OneDrive).*$/i,
+              ""
+            );
+            out = out.replace(/\.[a-z0-9]{2,5}$/i, "");
+            out = out.replace(/[-_\s]+Meeting Recording\s*$/i, "");
+            out = out.replace(/[-_\s]+\d{8}[_-]?\d{0,6}.*$/i, "");
+            return out.replace(/\s+/g, " ").trim();
+          }
+
+          let title = "";
+          const titleSelectors = [
+            '[data-tid="entity-header"] .fui-StyledText',
+            '[data-tid="app-layout-area--header"] .fui-StyledText',
+            '[data-tid="entity-header"] span[dir="auto"]',
+            '[data-automationid="videoTitle"]',
+            '[data-automationid="video-title"]',
+            '[data-automationid="pageTitle"]',
+            "main h1",
+            "h1",
+          ];
+          for (const sel of titleSelectors) {
+            const el = document.querySelector(sel);
+            if (!el) continue;
+            const t = (el.innerText || el.textContent || "")
+              .replace(/\s+/g, " ")
+              .trim();
+            if (t && t.length >= 2 && t.length < 200) {
+              title = stripTitleNoise(t);
+              break;
+            }
+          }
+          if (!title) {
+            title = stripTitleNoise((document.title || "").trim());
+          }
+
+          let dateIso = "";
+          const monthPattern =
+            /(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})/i;
+          const scopes = [document.querySelector("main"), document.body].filter(
+            Boolean
+          );
+          for (const scope of scopes) {
+            const text = (scope.innerText || "").slice(0, 20000);
+            const m = text.match(monthPattern);
+            if (m) {
+              const parsed = new Date(m[0]);
+              if (!isNaN(parsed.getTime())) {
+                dateIso = parsed.toISOString();
+                break;
+              }
+            }
+          }
+
+          return {
+            title,
+            dateIso,
+            url: location.href,
+          };
+        },
+      });
+
+      if (!results || !results.length || !results[0].result) return null;
+      return results[0].result;
+    } catch (_) {
+      return null;
+    }
   }
 
   // Begin exporting as soon as the popup opens — no button click required.
