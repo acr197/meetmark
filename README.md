@@ -4,11 +4,10 @@ Chrome and Firefox extension that converts Microsoft Teams meeting transcripts t
 [30s Demo](https://youtu.be/ZLr_SPXFyQY) (Sensitive data censored)
 
 ## What It Does
-Clicking the toolbar icon opens a small menu with three paths:
+Clicking the toolbar icon opens a small menu with two paths:
 
-- **Quick Grab MD** — one click and the current Teams / SharePoint Stream transcript is exported as Markdown, exactly like earlier versions of MeetMark.
-- **Grab as…** — the same transcript pipeline, but pick the output format: Markdown (`.md`), plain text (`.txt`), or PDF (opens a printable view and jumps to the browser's Save-as-PDF dialog).
-- **Capture full page as PNG** — works on any page. The extension scrolls the current tab top to bottom, captures each viewport via `chrome.tabs.captureVisibleTab`, stitches the captures into a single tall PNG, and downloads it. Modeled after Peter Coles' [full-page-screen-capture-chrome-extension](https://github.com/mrcoles/full-page-screen-capture-chrome-extension).
+- **Grab transcript as…** — picks the output format for the current Teams / SharePoint Stream transcript: Markdown (`.md`, default), plain text (`.txt`), or PDF (opens a printable view and jumps to the browser's Save-as-PDF dialog). Markdown is selected by default, so it's still effectively one click.
+- **Capture full page as PNG** — works on any http/https page. MeetMark attaches to the tab via the Chrome DevTools Protocol (`chrome.debugger` + `Page.captureScreenshot({ captureBeyondViewport: true })`) and returns one PNG covering the entire document, including content rendered inside inner scrollable containers like dashboards or Fluent UI panels (cases where plain window scrolling does nothing). This is the same technique GoFullPage uses.
 
 All processing runs locally — no network calls, no external APIs, no telemetry.
 
@@ -44,14 +43,14 @@ For permanent Firefox installation, submit via [addons.mozilla.org](https://addo
 1. Navigate to a Teams meeting recording in SharePoint Stream
 2. Open the Transcript panel (click **Transcript** in the video sidebar if it isn't already visible)
 3. Click the MeetMark toolbar icon
-4. Either click **Quick Grab MD** for the historical one-click Markdown export, or pick **Markdown / Plain text / PDF** from the **Grab as** dropdown and click **Grab**
+4. The format dropdown defaults to Markdown — just click **Grab**, or pick plain text or PDF first
 5. PDF opens a printable view and launches the browser print dialog; choose **Save as PDF** to write the file
 
 ### Full-page screenshot (PNG)
-1. Open the page you want to capture — this works on any site, not just Teams
-2. Click the MeetMark toolbar icon
-3. Click **Capture full page as PNG**. The extension briefly scrolls the page while capturing each viewport, then stitches the result into a single tall PNG and downloads it
-4. If the stitched image exceeds the browser's maximum canvas size, MeetMark falls back to multiple tiled PNGs (`<name>-1.png`, `<name>-2.png`, …)
+1. Open the page you want to capture — this works on any http/https site, not just Teams
+2. Click the MeetMark toolbar icon, then click **Capture full page as PNG**
+3. Chrome shows a yellow bar ("MeetMark started debugging this browser") for the few seconds the capture runs. That's normal — MeetMark needs the debugger API to render content that lives inside inner scrollable containers
+4. MeetMark downloads a single PNG covering the entire document. Close DevTools before running if it complains about another debugger being attached
 
 ## Privacy
 MeetMark runs entirely in your browser. It does not send transcript content to any server, does not call any external API, and has no analytics or telemetry. The only permission that touches the network is `downloads`, which is used solely to save the generated Markdown file to your local disk.

@@ -1,25 +1,24 @@
 // MeetMark popup controller.
 //
-// The popup exposes three export paths:
+// The popup exposes two export paths:
 //
-//   1. Quick Grab MD            — one-click transcript export as Markdown,
-//                                 the historical default behavior.
-//   2. Grab as (MD / TXT / PDF) — same transcript pipeline as Quick Grab,
-//                                 but the content is re-rendered in the
-//                                 chosen format before download. PDF opens
-//                                 a printable HTML tab so the user can Save
-//                                 as PDF from the browser print dialog.
-//   3. Capture full page as PNG — full-page screenshot of the current tab
-//                                 by scrolling the page, calling
-//                                 chrome.tabs.captureVisibleTab() at each
-//                                 arrangement, and stitching the captures
-//                                 into one PNG. Inspired by Peter Coles'
-//                                 full-page-screen-capture-chrome-extension.
-//                                 Works on any tab (relies on activeTab),
-//                                 not just Teams.
+//   1. Grab transcript as (MD / TXT / PDF) — runs the Teams / SharePoint
+//      Stream transcript pipeline and re-renders the result in the chosen
+//      format. Markdown is the default option, and the "Grab" button is
+//      effectively still one click for that case. PDF opens a printable
+//      HTML tab so the user can Save as PDF from the browser print dialog.
+//
+//   2. Capture full page as PNG — full-page screenshot of the current tab.
+//      We use the Chrome DevTools Protocol via chrome.debugger:
+//      Page.getLayoutMetrics tells us the real document size, then
+//      Page.captureScreenshot({ captureBeyondViewport: true, ... }) returns
+//      one PNG spanning the whole document. This is how GoFullPage works
+//      and it correctly captures pages where the content lives inside an
+//      inner scrollable container (dashboards, Fluent UI panels, etc.) —
+//      situations where plain window.scrollTo() does nothing.
+//      Works on any http(s) tab (relies on activeTab + debugger).
 
 document.addEventListener("DOMContentLoaded", () => {
-  const quickBtn = document.getElementById("quickBtn");
   const grabBtn = document.getElementById("grabBtn");
   const pngBtn = document.getElementById("pngBtn");
   const formatSelect = document.getElementById("formatSelect");
@@ -44,7 +43,6 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   function setBusy(busy, determinate) {
-    quickBtn.disabled = busy;
     grabBtn.disabled = busy;
     pngBtn.disabled = busy;
     formatSelect.disabled = busy;
@@ -259,14 +257,20 @@ document.addEventListener("DOMContentLoaded", () => {
   // PNG full-page screenshot flow
   // ---------------------------------------------------------------------------
   //
-  // The popup owns the chrome.tabs.captureVisibleTab calls and the canvas
-  // stitching. A content script (screenshot.js) injected into the top frame
-  // owns the scroll loop — it tells us which (x, y) to capture at each step
-  // and waits for our acknowledgement before scrolling to the next.
+  // We use the Chrome DevTools Protocol via chrome.debugger:
   //
-  // Chrome throttles captureVisibleTab to ~2/second; screenshot.js already
-  // waits CAPTURE_DELAY between scrolls, but we also rate-limit here by
-  // awaiting each capture before replying.
+  //   Page.getLayoutMetrics  → the real document size, including content
+  //                            that lives inside inner scrollable elements
+  //                            (dashboards, Fluent UI panels, etc.) where
+  //                            window.scrollTo() does not work.
+  //   Page.captureScreenshot({ captureBeyondViewport: true, clip })
+  //                          → one PNG spanning the full document.
+  //
+  // This replaces the earlier scroll-and-stitch approach, which only worked
+  // when window was the scrollable element and produced a single-viewport
+  // PNG on pages with inner scroll containers.
+
+  let debuggerAttachedTarget = null;
 
   async function startScreenshot() {
     setStatus("Starting screenshot...", "info");
@@ -301,226 +305,69 @@ document.addEventListener("DOMContentLoaded", () => {
       return;
     }
 
-    try {
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id, frameIds: [0] },
-        files: ["screenshot.js"],
-      });
-    } catch (err) {
+    if (!chrome.debugger || !chrome.debugger.attach) {
       setStatus(
-        "Could not attach to page: " +
-          (err && err.message ? err.message : String(err)),
+        "Full-page PNG capture requires Chrome's debugger API, which is not available in this browser.",
         "error"
       );
       setBusy(false);
       return;
     }
 
-    // Canvas(es) we stitch captures into. Lazily created once we know the
-    // page's full dimensions and the devicePixelRatio scale from the first
-    // captured image.
-    let screenshots = [];
-    let lastCaptureError = null;
-
-    const port = chrome.tabs.connect(tab.id, {
-      name: "meetmark-shot",
-      frameId: 0,
-    });
-    activePort = port;
-    activeCancel = () => {
-      try {
-        port.postMessage({ type: "cancel" });
-      } catch (_) {}
+    const target = { tabId: tab.id };
+    activeCancel = async () => {
+      await safeDetach(target);
     };
 
-    port.onDisconnect.addListener(() => {
-      if (activePort === port) activePort = null;
-    });
+    try {
+      setStatus("Attaching to page...", "info");
+      await debuggerAttach(target, "1.3");
+      debuggerAttachedTarget = target;
 
-    port.onMessage.addListener(async (msg) => {
-      if (!msg || !msg.type) return;
-      try {
-        if (msg.type === "capture") {
-          await handleCaptureAt(msg, screenshots, tab.id);
-          setProgress(msg.complete || 0);
-          try {
-            port.postMessage({ type: "captured" });
-          } catch (_) {}
-        } else if (msg.type === "done") {
-          await finishScreenshot(screenshots, tab);
-        } else if (msg.type === "error") {
-          setStatus(msg.message || "Screenshot failed.", "error");
-          closePort();
-        } else if (msg.type === "progress") {
-          setStatus(msg.message || "Working...", "info");
-        }
-      } catch (err) {
-        lastCaptureError = err;
-        setStatus(
-          "Screenshot error: " +
-            (err && err.message ? err.message : String(err)),
-          "error"
-        );
-        try {
-          port.postMessage({ type: "cancel" });
-        } catch (_) {}
-        closePort();
-      }
-    });
-
-    setStatus("Measuring page...", "info");
-    port.postMessage({ type: "start" });
-
-    // If screenshot.js never responds (e.g. a weird CSP blocks injection),
-    // the port will idle indefinitely. Give up after 30 s with no messages.
-    // (Each capture resets the timer via the message listener above — we
-    // don't wire that up for simplicity; the overall 30 s is a backstop.)
-    setTimeout(() => {
-      if (activePort === port && !lastCaptureError) {
-        // Still running — don't cancel. This handler is only for the case
-        // where screenshot.js never sent the first message. Best-effort
-        // heuristic: if no captures happened yet, bail.
-        if (screenshots.length === 0) {
-          setStatus("Page did not respond. Try reloading and retrying.", "error");
-          try {
-            port.postMessage({ type: "cancel" });
-          } catch (_) {}
-          closePort();
-        }
-      }
-    }, 30000);
-  }
-
-  // Draw one viewport capture into the appropriate stitched canvas(es).
-  async function handleCaptureAt(info, screenshots, tabId) {
-    // We call captureVisibleTab without a windowId — it captures the active
-    // tab of the current window, which is the tab under the popup.
-    const dataUrl = await chrome.tabs.captureVisibleTab(null, {
-      format: "png",
-    });
-    if (!dataUrl) {
-      throw new Error("captureVisibleTab returned no data. The browser may have throttled the capture.");
-    }
-
-    const image = await loadImage(dataUrl);
-
-    // On high-DPI displays captureVisibleTab returns a larger image than the
-    // logical window size. Scale the stitching math to match.
-    let x = info.x;
-    let y = info.y;
-    let totalWidth = info.totalWidth;
-    let totalHeight = info.totalHeight;
-    if (info.windowWidth && info.windowWidth !== image.width) {
-      const scale = image.width / info.windowWidth;
-      x *= scale;
-      y *= scale;
-      totalWidth *= scale;
-      totalHeight *= scale;
-    }
-
-    // Lazily init the canvas(es) once we know the real pixel dimensions.
-    if (!screenshots.length) {
-      initScreenshots(totalWidth, totalHeight).forEach((s) =>
-        screenshots.push(s)
+      setStatus("Measuring page...", "info");
+      // Enable the Page domain so getLayoutMetrics returns stable values.
+      await debuggerSend(target, "Page.enable", {});
+      const metrics = await debuggerSend(
+        target,
+        "Page.getLayoutMetrics",
+        {}
       );
-    }
 
-    // Draw into every canvas whose rect intersects this capture's rect.
-    const imgRight = x + image.width;
-    const imgBottom = y + image.height;
-    for (const s of screenshots) {
-      if (
-        x < s.right &&
-        imgRight > s.left &&
-        y < s.bottom &&
-        imgBottom > s.top
-      ) {
-        s.ctx.drawImage(image, x - s.left, y - s.top);
+      // cssContentSize is the post-CSS-pixel document size (what we want);
+      // Chrome >=89 exposes it, older versions only expose contentSize in
+      // device pixels. Fall back as needed.
+      const size = metrics.cssContentSize || metrics.contentSize;
+      if (!size || !size.width || !size.height) {
+        throw new Error("Browser did not report a document size.");
       }
-    }
-  }
+      const width = Math.max(1, Math.ceil(size.width));
+      const height = Math.max(1, Math.ceil(size.height));
 
-  // Max canvas dimension Chrome will reliably encode to PNG. Matches
-  // mrcoles' full-page-screen-capture constants.
-  const MAX_PRIMARY = 15000 * 2;
-  const MAX_SECONDARY = 4000 * 2;
-  const MAX_AREA = MAX_PRIMARY * MAX_SECONDARY;
+      setProgress(0.25);
+      setStatus(
+        "Capturing full page (" + width + " × " + height + ")...",
+        "info"
+      );
 
-  // If the stitched image is bigger than the browser can safely encode to
-  // PNG, break it up into tiles. Returns an array of { canvas, ctx, left,
-  // top, right, bottom }.
-  function initScreenshots(totalWidth, totalHeight) {
-    const tooBig =
-      totalHeight > MAX_PRIMARY ||
-      totalWidth > MAX_PRIMARY ||
-      totalHeight * totalWidth > MAX_AREA;
-    const biggerWidth = totalWidth > totalHeight;
-    const maxWidth = !tooBig
-      ? totalWidth
-      : biggerWidth
-      ? MAX_PRIMARY
-      : MAX_SECONDARY;
-    const maxHeight = !tooBig
-      ? totalHeight
-      : biggerWidth
-      ? MAX_SECONDARY
-      : MAX_PRIMARY;
-    const numCols = Math.max(1, Math.ceil(totalWidth / maxWidth));
-    const numRows = Math.max(1, Math.ceil(totalHeight / maxHeight));
+      // captureBeyondViewport: true tells Chrome to render the entire clip,
+      // including offscreen/inner-scrollable content, into one image.
+      const shot = await debuggerSend(target, "Page.captureScreenshot", {
+        format: "png",
+        captureBeyondViewport: true,
+        fromSurface: true,
+        clip: { x: 0, y: 0, width, height, scale: 1 },
+      });
 
-    const result = [];
-    for (let row = 0; row < numRows; row++) {
-      for (let col = 0; col < numCols; col++) {
-        const canvas = document.createElement("canvas");
-        canvas.width =
-          col === numCols - 1 ? totalWidth - col * maxWidth : maxWidth;
-        canvas.height =
-          row === numRows - 1 ? totalHeight - row * maxHeight : maxHeight;
-        const left = col * maxWidth;
-        const top = row * maxHeight;
-        result.push({
-          canvas,
-          ctx: canvas.getContext("2d"),
-          left,
-          top,
-          right: left + canvas.width,
-          bottom: top + canvas.height,
-        });
+      if (!shot || !shot.data) {
+        throw new Error("Capture returned no image data.");
       }
-    }
-    return result;
-  }
 
-  function loadImage(dataUrl) {
-    return new Promise((resolve, reject) => {
-      const img = new Image();
-      img.onload = () => resolve(img);
-      img.onerror = () =>
-        reject(new Error("Could not decode captured viewport image."));
-      img.src = dataUrl;
-    });
-  }
+      setProgress(0.9);
+      setStatus("Downloading...", "info");
 
-  async function finishScreenshot(screenshots, tab) {
-    if (!screenshots.length) {
-      setStatus("Nothing to save — no viewport captures collected.", "error");
-      closePort();
-      return;
-    }
-
-    setStatus("Encoding PNG...", "info");
-    setProgress(1);
-
-    const baseName = buildScreenshotFilename(tab.url);
-    let downloaded = 0;
-    const total = screenshots.length;
-
-    for (let i = 0; i < screenshots.length; i++) {
-      const suffix = total > 1 ? "-" + (i + 1) : "";
-      const filename = baseName + suffix + ".png";
-      const dataUrl = screenshots[i].canvas.toDataURL("image/png");
-
-      const result = await chrome.runtime.sendMessage({
+      const filename = buildScreenshotFilename(tab.url) + ".png";
+      const dataUrl = "data:image/png;base64," + shot.data;
+      const dl = await chrome.runtime.sendMessage({
         type: "MEETMARK_DOWNLOAD",
         filename,
         dataUrl,
@@ -528,31 +375,79 @@ document.addEventListener("DOMContentLoaded", () => {
         format: "png",
       });
 
-      if (result && result.ok) {
-        downloaded++;
+      if (dl && dl.ok) {
+        setProgress(1);
+        setStatus(
+          "Done. Saved full-page PNG: " + filename,
+          "success"
+        );
+        setDetail(width + " × " + height + " pixels");
       } else {
         setStatus(
-          "Download failed: " +
-            ((result && result.error) || "unknown error"),
+          "Download failed: " + ((dl && dl.error) || "unknown error"),
           "error"
         );
-        closePort();
-        return;
       }
+    } catch (err) {
+      const msg = (err && err.message) || String(err);
+      if (/cannot access|debugger/i.test(msg) && /another/i.test(msg)) {
+        setStatus(
+          "Another debugger is already attached to this tab (DevTools open?). Close DevTools and try again.",
+          "error"
+        );
+      } else {
+        setStatus("Screenshot error: " + msg, "error");
+      }
+    } finally {
+      await safeDetach(target);
+      activeCancel = null;
+      setBusy(false);
     }
+  }
 
-    if (total > 1) {
-      setStatus(
-        "Done. Page was too tall for a single image — saved " +
-          total +
-          " PNG tiles.",
-        "success"
-      );
-    } else {
-      setStatus("Done. Saved full-page PNG (" + downloaded + " file).", "success");
+  // Promisified wrappers — chrome.debugger still uses callbacks in MV3.
+  function debuggerAttach(target, version) {
+    return new Promise((resolve, reject) => {
+      try {
+        chrome.debugger.attach(target, version, () => {
+          const err = chrome.runtime.lastError;
+          if (err) return reject(new Error(err.message));
+          resolve();
+        });
+      } catch (e) {
+        reject(e);
+      }
+    });
+  }
+
+  function debuggerSend(target, method, params) {
+    return new Promise((resolve, reject) => {
+      try {
+        chrome.debugger.sendCommand(target, method, params || {}, (result) => {
+          const err = chrome.runtime.lastError;
+          if (err) return reject(new Error(err.message));
+          resolve(result);
+        });
+      } catch (e) {
+        reject(e);
+      }
+    });
+  }
+
+  async function safeDetach(target) {
+    if (!debuggerAttachedTarget) return;
+    debuggerAttachedTarget = null;
+    try {
+      await new Promise((resolve) => {
+        chrome.debugger.detach(target, () => {
+          // Swallow lastError — we don't care if the target is already gone.
+          void chrome.runtime.lastError;
+          resolve();
+        });
+      });
+    } catch (_) {
+      /* ignore */
     }
-    setDetail("");
-    closePort();
   }
 
   function buildScreenshotFilename(url) {
@@ -583,7 +478,6 @@ document.addEventListener("DOMContentLoaded", () => {
   // Button wiring
   // ---------------------------------------------------------------------------
 
-  quickBtn.addEventListener("click", () => startTranscriptExport("md"));
   grabBtn.addEventListener("click", () =>
     startTranscriptExport(formatSelect.value || "md")
   );
