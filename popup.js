@@ -21,10 +21,50 @@ document.addEventListener("DOMContentLoaded", () => {
   const pngBtn = document.getElementById("pngBtn");
   const formatSelect = document.getElementById("formatSelect");
   const cancelBtn = document.getElementById("cancelBtn");
+  const cancelRow = document.getElementById("cancelRow");
   const status = document.getElementById("status");
   const detail = document.getElementById("detail");
   const progressBar = document.getElementById("progressBar");
   const progressFill = progressBar.querySelector(".fill");
+  const dlAutoRadio = document.getElementById("dlAuto");
+  const dlAskRadio = document.getElementById("dlAsk");
+  const subfolderRow = document.getElementById("subfolderRow");
+  const subfolderInput = document.getElementById("subfolderInput");
+
+  // Download preferences: "auto" (default) or "ask".
+  let dlMode = "auto";
+  let dlSubfolder = "";
+
+  function applyDlMode(mode) {
+    dlMode = mode;
+    dlAutoRadio.checked = mode === "auto";
+    dlAskRadio.checked = mode === "ask";
+    subfolderRow.classList.toggle("hidden", mode !== "auto");
+  }
+
+  // Load persisted settings.
+  chrome.storage.local.get(["dlMode", "dlSubfolder"], (prefs) => {
+    applyDlMode(prefs.dlMode === "ask" ? "ask" : "auto");
+    dlSubfolder = (prefs.dlSubfolder || "").trim();
+    subfolderInput.value = dlSubfolder;
+  });
+
+  dlAutoRadio.addEventListener("change", () => {
+    if (dlAutoRadio.checked) {
+      applyDlMode("auto");
+      chrome.storage.local.set({ dlMode: "auto" });
+    }
+  });
+  dlAskRadio.addEventListener("change", () => {
+    if (dlAskRadio.checked) {
+      applyDlMode("ask");
+      chrome.storage.local.set({ dlMode: "ask" });
+    }
+  });
+  subfolderInput.addEventListener("input", () => {
+    dlSubfolder = subfolderInput.value.trim();
+    chrome.storage.local.set({ dlSubfolder });
+  });
 
   // Exactly one of these is active at a time. The cancel button talks to
   // whichever is set.
@@ -44,7 +84,7 @@ document.addEventListener("DOMContentLoaded", () => {
     grabBtn.disabled = busy;
     pngBtn.disabled = busy;
     formatSelect.disabled = busy;
-    cancelBtn.disabled = !busy;
+    cancelRow.classList.toggle("visible", busy);
     if (busy) {
       progressBar.classList.add("active");
       if (determinate) {
@@ -120,6 +160,28 @@ document.addEventListener("DOMContentLoaded", () => {
   // Transcript flows (Quick Grab + Grab as MD/TXT/PDF)
   // ---------------------------------------------------------------------------
 
+  // Teams/SharePoint host access is declared as optional so the extension
+  // carries no persistent "Site access" warning. We request it on first use.
+  async function ensureTranscriptPermissions() {
+    const origins = [
+      "https://teams.microsoft.com/*",
+      "https://*.teams.microsoft.com/*",
+      "https://*.sharepoint.com/*",
+    ];
+    try {
+      const has = await new Promise((resolve) =>
+        chrome.permissions.contains({ origins }, resolve)
+      );
+      if (has) return true;
+      const granted = await new Promise((resolve) =>
+        chrome.permissions.request({ origins }, resolve)
+      );
+      return !!granted;
+    } catch (_) {
+      return false;
+    }
+  }
+
   async function startTranscriptExport(format) {
     setStatus("Starting...", "info");
     setDetail("");
@@ -140,6 +202,16 @@ document.addEventListener("DOMContentLoaded", () => {
       if (!isTranscriptUrl(tab.url)) {
         setStatus(
           "Open a Teams or SharePoint Stream recording page, then try again.",
+          "error"
+        );
+        setBusy(false);
+        return;
+      }
+
+      const permitted = await ensureTranscriptPermissions();
+      if (!permitted) {
+        setStatus(
+          "Permission required to access Teams and SharePoint pages.",
           "error"
         );
         setBusy(false);
@@ -216,6 +288,8 @@ document.addEventListener("DOMContentLoaded", () => {
         content: msg.content,
         mime: msg.mime,
         format: msg.format,
+        saveAs: dlMode === "ask",
+        subfolder: dlMode === "auto" ? dlSubfolder : "",
       });
 
       if (downloadResult && downloadResult.ok) {
@@ -521,6 +595,8 @@ document.addEventListener("DOMContentLoaded", () => {
             dataUrl,
             mime: "image/png",
             format: "png",
+            saveAs: dlMode === "ask",
+            subfolder: dlMode === "auto" ? dlSubfolder : "",
           });
           if (dl && dl.ok) {
             savedCount++;

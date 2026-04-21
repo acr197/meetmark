@@ -99,9 +99,54 @@
     }
     .cancelRow {
       margin-top: 12px;
+      display: none;
+    }
+    .cancelRow.visible {
+      display: block;
     }
     .cancelRow button {
       width: 100%;
+    }
+    .settingsSection {
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid #eeeef6;
+    }
+    .radioRow {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      margin-top: 4px;
+    }
+    .radioRow label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .radioRow input[type="radio"] {
+      margin: 0;
+      cursor: pointer;
+    }
+    .subfolderRow {
+      margin-top: 6px;
+    }
+    .subfolderRow input[type="text"] {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 6px 8px;
+      border-radius: 6px;
+      border: 1px solid #c8cad9;
+      font-size: 12px;
+      color: #1f1f1f;
+      background: #fff;
+    }
+    .subfolderRow input[type="text"]::placeholder {
+      color: #9aa0a6;
+    }
+    .subfolderRow.hidden {
+      display: none;
     }
     .status {
       margin-top: 14px;
@@ -168,12 +213,23 @@
     <button id="pngBtn" class="secondary">Capture full page as PNG</button>
   </div>
 
+  <div class="settingsSection">
+    <div class="sectionLabel">Download</div>
+    <div class="radioRow">
+      <label><input type="radio" name="dlMode" value="auto" id="dlAuto"> Save automatically</label>
+      <label><input type="radio" name="dlMode" value="ask" id="dlAsk"> Ask where to save</label>
+    </div>
+    <div class="subfolderRow" id="subfolderRow">
+      <input type="text" id="subfolderInput" placeholder="Subfolder in Downloads (optional)" maxlength="80" />
+    </div>
+  </div>
+
   <div class="progressBar" id="progressBar"><div class="fill"></div></div>
   <div id="status" class="status info"></div>
   <div id="detail" class="detail"></div>
 
-  <div class="cancelRow">
-    <button id="cancelBtn" class="secondary" disabled>Cancel</button>
+  <div class="cancelRow" id="cancelRow">
+    <button id="cancelBtn" class="secondary">Cancel</button>
   </div>
   <script src="popup.js"></script>
 </body>

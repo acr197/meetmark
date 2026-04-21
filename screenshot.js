@@ -113,8 +113,14 @@
         originalElY = target.el.scrollTop;
       }
 
+      // Populated before captures begin; referenced by cleanUp via closure.
+      var _fixedHidden = [];
+      var _scrollbarStyle = null;
+
       cleanUp = function () {
         try {
+          restoreHiddenElements(_fixedHidden);
+          removeStyleEl(_scrollbarStyle);
           docEl.style.overflow = originalHtmlOverflowStyle;
           if (body) body.style.overflowY = originalBodyOverflowYStyle;
           window.scrollTo(originalWinX, originalWinY);
@@ -176,6 +182,12 @@
       // driving the window; otherwise we leave the root alone so the inner
       // container keeps its own layout.
       if (usingWindow) docEl.style.overflow = "hidden";
+
+      // Hide position:fixed overlays (sticky headers, comment boxes, chat
+      // widgets, etc.) so they don't repeat in every viewport tile.
+      // Also inject a stylesheet that suppresses scrollbar tracks.
+      _fixedHidden = hideFixedElements();
+      _scrollbarStyle = injectScrollbarHider();
 
       // Build the grid of scroll positions. Bottom-up / left-to-right, same
       // order as GoFullPage. Negative y values clamp to 0 at scroll time;
@@ -422,5 +434,69 @@
         return x;
       })
     );
+  }
+
+  // Find all position:fixed elements (toolbars, comment boxes, overlays) and
+  // hide them so they don't appear in every captured tile. Returns a list of
+  // {el, visibility} records for restoreHiddenElements().
+  function hideFixedElements() {
+    var hidden = [];
+    try {
+      var nodes = document.querySelectorAll("*");
+      for (var i = 0; i < nodes.length; i++) {
+        var el = nodes[i];
+        if (el === document.documentElement || el === document.body) continue;
+        var cs;
+        try {
+          cs = getComputedStyle(el);
+        } catch (_) {
+          continue;
+        }
+        if (cs.position !== "fixed") continue;
+        // Skip elements that are already invisible — no need to track them.
+        if (cs.display === "none" || cs.visibility === "hidden") continue;
+        // Skip zero-size elements (they wouldn't appear in the capture anyway).
+        try {
+          var r = el.getBoundingClientRect();
+          if (r.width === 0 && r.height === 0) continue;
+        } catch (_) {}
+        hidden.push({ el: el, visibility: el.style.visibility });
+        el.style.setProperty("visibility", "hidden", "important");
+      }
+    } catch (_) {}
+    return hidden;
+  }
+
+  function restoreHiddenElements(hidden) {
+    if (!hidden) return;
+    for (var i = 0; i < hidden.length; i++) {
+      try {
+        hidden[i].el.style.visibility = hidden[i].visibility;
+      } catch (_) {}
+    }
+  }
+
+  // Inject a <style> that hides scrollbar tracks so they don't appear as
+  // repeated artefacts along the edges of captured tiles.
+  function injectScrollbarHider() {
+    try {
+      var style = document.createElement("style");
+      style.id = "__meetmark_noscrollbar__";
+      style.textContent =
+        "::-webkit-scrollbar{display:none!important}" +
+        "*{scrollbar-width:none!important}";
+      (document.head || document.documentElement).appendChild(style);
+      return style;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  function removeStyleEl(el) {
+    if (el && el.parentNode) {
+      try {
+        el.parentNode.removeChild(el);
+      } catch (_) {}
+    }
   }
 })();
