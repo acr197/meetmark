@@ -6,7 +6,8 @@
   "permissions": [
     "activeTab",
     "downloads",
-    "scripting"
+    "scripting",
+    "debugger"
   ],
   "host_permissions": [
     "https://teams.microsoft.com/*",
