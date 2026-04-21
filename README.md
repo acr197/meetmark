@@ -7,7 +7,7 @@ Chrome and Firefox extension that converts Microsoft Teams meeting transcripts t
 Clicking the toolbar icon opens a small menu with two paths:
 
 - **Grab transcript as…** — picks the output format for the current Teams / SharePoint Stream transcript: Markdown (`.md`, default), plain text (`.txt`), or PDF (opens a printable view and jumps to the browser's Save-as-PDF dialog). Markdown is selected by default, so it's still effectively one click.
-- **Capture full page as PNG** — works on any http/https page. MeetMark attaches to the tab via the Chrome DevTools Protocol (`chrome.debugger` + `Page.captureScreenshot({ captureBeyondViewport: true })`) and returns one PNG covering the entire document, including content rendered inside inner scrollable containers like dashboards or Fluent UI panels (cases where plain window scrolling does nothing). This is the same technique GoFullPage uses.
+- **Capture full page as PNG** — works on any http/https page. MeetMark injects a content script that scrolls the page through a grid of viewport positions and, for each, calls `chrome.tabs.captureVisibleTab`. The popup stitches the captured tiles into one offscreen canvas (or several, for very long pages) and saves the result as a PNG via `chrome.downloads`. This is a faithful port of [mrcoles / GoFullPage](https://github.com/mrcoles/full-page-screen-capture-chrome-extension) adapted for MV3 (long-lived port messaging, `captured` ack before each scroll so captures stay under Chrome's rate limit).
 
 All processing runs locally — no network calls, no external APIs, no telemetry.
 
@@ -49,8 +49,8 @@ For permanent Firefox installation, submit via [addons.mozilla.org](https://addo
 ### Full-page screenshot (PNG)
 1. Open the page you want to capture — this works on any http/https site, not just Teams
 2. Click the MeetMark toolbar icon, then click **Capture full page as PNG**
-3. Chrome shows a yellow bar ("MeetMark started debugging this browser") for the few seconds the capture runs. That's normal — MeetMark needs the debugger API to render content that lives inside inner scrollable containers
-4. MeetMark downloads a single PNG covering the entire document. Close DevTools before running if it complains about another debugger being attached
+3. The page will scroll from bottom to top as MeetMark captures each viewport. Let it run — the whole page is captured in a few seconds
+4. MeetMark downloads one PNG covering the entire document. For extremely long pages (beyond ~30,000 device pixels on either axis) the output is split into multiple PNG tiles so it stays within the browser's canvas size limits
 
 ## Privacy
 MeetMark runs entirely in your browser. It does not send transcript content to any server, does not call any external API, and has no analytics or telemetry. The only permission that touches the network is `downloads`, which is used solely to save the generated Markdown file to your local disk.
