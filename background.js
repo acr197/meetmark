@@ -37,13 +37,15 @@ function buildTextDataUrl(content, mime) {
   return "data:" + type + ";base64," + utf8ToBase64(content);
 }
 
-function startDownload(url, filename, sendResponse) {
+function startDownload(url, filename, saveAs, sendResponse) {
+  // Prepend subfolder if embedded in filename (e.g. "MeetMark/file.png").
+  // chrome.downloads.download accepts relative paths within the Downloads dir.
   try {
     chrome.downloads.download(
       {
         url,
         filename,
-        saveAs: false,
+        saveAs: !!saveAs,
       },
       (downloadId) => {
         if (chrome.runtime.lastError) {
@@ -99,8 +101,18 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   }
 
   try {
-    const filename = (message.filename || "transcript.md").toString();
     const format = (message.format || "md").toString();
+    const saveAs = !!message.saveAs;
+
+    // Build the final filename. When saveAs is false we may prepend an
+    // optional subfolder (relative path within the Downloads directory).
+    const rawFilename = (message.filename || "transcript.md").toString();
+    const subfolder = (message.subfolder || "").toString().trim()
+      .replace(/[\\:*?"<>|]/g, "")  // strip illegal path chars
+      .replace(/^\/+|\/+$/g, "");    // strip leading/trailing slashes
+    const filename = subfolder && !saveAs
+      ? subfolder + "/" + rawFilename
+      : rawFilename;
 
     if (format === "pdf") {
       // The "content" is printable HTML — hand it to a new tab for the
@@ -118,7 +130,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         sendResponse({ ok: false, error: "No PNG data URL supplied." });
         return true;
       }
-      startDownload(url, filename, sendResponse);
+      startDownload(url, filename, saveAs, sendResponse);
       return true;
     }
 
@@ -127,7 +139,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     const content = (message.content || "").toString();
     const mime = (message.mime || "text/markdown;charset=utf-8").toString();
     const url = buildTextDataUrl(content, mime);
-    startDownload(url, filename, sendResponse);
+    startDownload(url, filename, saveAs, sendResponse);
   } catch (err) {
     sendResponse({
       ok: false,
