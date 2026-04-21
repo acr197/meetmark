@@ -63,7 +63,12 @@
         return cancelled;
       }
 
-      runExport(port, isCancelled)
+      const parentMetadata =
+        msg.parentMetadata && typeof msg.parentMetadata === "object"
+          ? msg.parentMetadata
+          : null;
+
+      runExport(port, isCancelled, parentMetadata)
         .then((result) => {
           if (cancelled) return;
           if (result.ok) {
@@ -100,7 +105,13 @@
 
   // Top-level orchestration. Returns { ok, markdown, filename, warning,
   // turnCount, speakerCount } or { ok: false, error }.
-  async function runExport(port, isCancelled) {
+  //
+  // parentMetadata is the { title, dateIso, url } the popup probed from the
+  // top frame before starting the export. It's only supplied when the scrape
+  // is happening inside a child frame (e.g. the Teams Recap xplat iframe),
+  // because none of the Teams page chrome — meeting title, date, the user-
+  // facing URL — is reachable from inside that cross-origin iframe.
+  async function runExport(port, isCancelled, parentMetadata) {
     function progress(message, detail) {
       if (!port) return;
       try {
@@ -196,7 +207,10 @@
       .filter((t) => t.text.length > 0 || t.speaker.length > 0);
     const mergedTurns = mergeAdjacentTurns(cleanedTurns);
     const participants = collectParticipants(mergedTurns);
-    const metadata = extractMeetingMetadata();
+    const metadata = mergeParentMetadata(
+      extractMeetingMetadata(),
+      parentMetadata
+    );
     const markdown = formatMarkdown(mergedTurns, participants, metadata);
     const filename = buildFilename(metadata);
 
@@ -1590,15 +1604,63 @@
     };
   }
 
+  // Merge metadata probed from the top Teams frame into the metadata scraped
+  // from the current (possibly iframe) document. Parent-frame values win for
+  // title and url because the Teams Recap page chrome carries the
+  // human-meaningful meeting title and the URL the user actually navigated
+  // to — the SharePoint xplat iframe's own URL is opaque plumbing. For the
+  // date we only accept the parent's value when the local scrape came up
+  // empty (or returned today's fallback), so that a meeting-date string
+  // visible inside the transcript panel still takes precedence when present.
+  function mergeParentMetadata(local, parent) {
+    if (!parent) return local;
+    const merged = { ...local };
+
+    if (parent.title && parent.title.trim()) {
+      merged.title = parent.title.trim();
+    }
+    if (parent.url && parent.url.trim()) {
+      merged.url = parent.url.trim();
+    }
+    if (parent.dateIso) {
+      const parsed = new Date(parent.dateIso);
+      if (!isNaN(parsed.getTime())) {
+        const localLooksLikeFallback =
+          !merged.date || isSameDay(merged.date, new Date());
+        if (localLooksLikeFallback) {
+          merged.date = parsed;
+        }
+      }
+    }
+    return merged;
+  }
+
+  function isSameDay(a, b) {
+    if (!a || !b) return false;
+    return (
+      a.getFullYear() === b.getFullYear() &&
+      a.getMonth() === b.getMonth() &&
+      a.getDate() === b.getDate()
+    );
+  }
+
   // Find the meeting title. Tries Stream-specific heading hooks first, then
   // any H1/H2 on the page, then falls back to parsing document.title.
   function extractMeetingTitle() {
     const titleSelectors = [
+      // SharePoint Stream hooks.
       '[data-automationid="videoTitle"]',
       '[data-automationid="video-title"]',
       '[data-automationid="pageTitle"]',
       '[data-automationid="DocumentTitle"]',
       '[data-automationid="titleField"]',
+      // Teams Calendar / Recap header — the meeting title is rendered as a
+      // FluentUI styled span inside the entity-header layout slot, with no
+      // heading element around it.
+      '[data-tid="entity-header"] .fui-StyledText',
+      '[data-tid="app-layout-area--header"] .fui-StyledText',
+      '[data-tid="entity-header"] span[dir="auto"]',
+      // Generic headings.
       "main h1",
       "h1",
       "h2",
