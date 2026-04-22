@@ -26,8 +26,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const detail = document.getElementById("detail");
   const progressBar = document.getElementById("progressBar");
   const progressFill = progressBar.querySelector(".fill");
-  const dlAutoRadio = document.getElementById("dlAuto");
-  const dlAskRadio = document.getElementById("dlAsk");
+  const dlModeSelect = document.getElementById("dlModeSelect");
   const folderRow = document.getElementById("folderRow");
   const folderNameEl = document.getElementById("folderName");
   const chooseFolderBtn = document.getElementById("chooseFolderBtn");
@@ -105,8 +104,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
   function applyDlMode(mode) {
     dlMode = mode;
-    dlAutoRadio.checked = mode === "auto";
-    dlAskRadio.checked = mode === "ask";
+    dlModeSelect.value = mode;
     folderRow.classList.toggle("hidden", mode !== "auto");
   }
 
@@ -122,17 +120,9 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   }).catch(() => {});
 
-  dlAutoRadio.addEventListener("change", () => {
-    if (dlAutoRadio.checked) {
-      applyDlMode("auto");
-      chrome.storage.local.set({ dlMode: "auto" });
-    }
-  });
-  dlAskRadio.addEventListener("change", () => {
-    if (dlAskRadio.checked) {
-      applyDlMode("ask");
-      chrome.storage.local.set({ dlMode: "ask" });
-    }
+  dlModeSelect.addEventListener("change", () => {
+    applyDlMode(dlModeSelect.value);
+    chrome.storage.local.set({ dlMode: dlModeSelect.value });
   });
 
   chooseFolderBtn.addEventListener("click", async () => {
@@ -245,28 +235,6 @@ document.addEventListener("DOMContentLoaded", () => {
   // Transcript flows (Quick Grab + Grab as MD/TXT/PDF)
   // ---------------------------------------------------------------------------
 
-  // Teams/SharePoint host access is declared as optional so the extension
-  // carries no persistent "Site access" warning. We request it on first use.
-  async function ensureTranscriptPermissions() {
-    const origins = [
-      "https://teams.microsoft.com/*",
-      "https://*.teams.microsoft.com/*",
-      "https://*.sharepoint.com/*",
-    ];
-    try {
-      const has = await new Promise((resolve) =>
-        chrome.permissions.contains({ origins }, resolve)
-      );
-      if (has) return true;
-      const granted = await new Promise((resolve) =>
-        chrome.permissions.request({ origins }, resolve)
-      );
-      return !!granted;
-    } catch (_) {
-      return false;
-    }
-  }
-
   async function startTranscriptExport(format) {
     setStatus("Starting...", "info");
     setDetail("");
@@ -287,16 +255,6 @@ document.addEventListener("DOMContentLoaded", () => {
       if (!isTranscriptUrl(tab.url)) {
         setStatus(
           "Open a Teams or SharePoint Stream recording page, then try again.",
-          "error"
-        );
-        setBusy(false);
-        return;
-      }
-
-      const permitted = await ensureTranscriptPermissions();
-      if (!permitted) {
-        setStatus(
-          "Permission required to access Teams and SharePoint pages.",
           "error"
         );
         setBusy(false);

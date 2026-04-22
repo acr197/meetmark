@@ -65,13 +65,9 @@
       letter-spacing: 0.6px;
       font-weight: 600;
     }
-    .row {
-      display: flex;
-      gap: 8px;
-      align-items: stretch;
-    }
-    .row select {
-      flex: 1;
+    .fullSelect {
+      width: 100%;
+      box-sizing: border-box;
       padding: 9px 8px;
       border-radius: 6px;
       border: 1px solid #c8cad9;
@@ -79,13 +75,11 @@
       background: #ffffff;
       color: #1f1f1f;
     }
-    .row button {
-      padding: 9px 16px;
-      white-space: nowrap;
-      flex: 0 0 auto;
+    .grabFull {
+      margin-top: 8px;
     }
-    .row .grabBtn {
-      min-width: 64px;
+    .grabFull button {
+      width: 100%;
     }
     .divider {
       text-align: center;
@@ -112,22 +106,16 @@
       padding-top: 12px;
       border-top: 1px solid #eeeef6;
     }
-    .radioRow {
-      display: flex;
-      flex-direction: column;
-      gap: 4px;
-      margin-top: 4px;
-    }
-    .radioRow label {
-      display: flex;
-      align-items: center;
-      gap: 6px;
+    .dlSelect {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 7px 8px;
+      border-radius: 6px;
+      border: 1px solid #c8cad9;
       font-size: 12px;
-      cursor: pointer;
-    }
-    .radioRow input[type="radio"] {
-      margin: 0;
-      cursor: pointer;
+      background: #ffffff;
+      color: #1f1f1f;
+      margin-top: 4px;
     }
     .folderRow {
       margin-top: 6px;
@@ -212,13 +200,13 @@
   <p class="sub">Export the transcript or capture the full page.</p>
 
   <div class="sectionLabel">Grab transcript as</div>
-  <div class="row">
-    <select id="formatSelect" aria-label="Export format">
-      <option value="md">Markdown (.md)</option>
-      <option value="txt">Plain text (.txt)</option>
-      <option value="pdf">PDF (.pdf)</option>
-    </select>
-    <button id="grabBtn" class="primary grabBtn">Grab</button>
+  <select id="formatSelect" class="fullSelect" aria-label="Export format">
+    <option value="md">Markdown (.md)</option>
+    <option value="txt">Plain text (.txt)</option>
+    <option value="pdf">PDF (.pdf)</option>
+  </select>
+  <div class="grabFull">
+    <button id="grabBtn" class="primary">Grab</button>
   </div>
 
   <div class="divider">— or —</div>
@@ -228,13 +216,13 @@
   </div>
 
   <div class="settingsSection">
-    <div class="sectionLabel">Download</div>
-    <div class="radioRow">
-      <label><input type="radio" name="dlMode" value="auto" id="dlAuto"> Save automatically</label>
-      <label><input type="radio" name="dlMode" value="ask" id="dlAsk"> Ask where to save</label>
-    </div>
+    <div class="sectionLabel">Download options</div>
+    <select id="dlModeSelect" class="dlSelect">
+      <option value="auto">Save automatically</option>
+      <option value="ask">Ask where to save</option>
+    </select>
     <div class="folderRow" id="folderRow">
-      <button class="folderBtn" id="chooseFolderBtn" type="button">Choose folder…</button>
+      <button class="folderBtn" id="chooseFolderBtn" type="button">Select folder…</button>
       <span class="folderName" id="folderName">Default Downloads folder</span>
     </div>
   </div>

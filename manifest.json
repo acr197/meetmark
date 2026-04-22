@@ -9,7 +9,7 @@
     "scripting",
     "storage"
   ],
-  "optional_host_permissions": [
+  "host_permissions": [
     "https://teams.microsoft.com/*",
     "https://*.teams.microsoft.com/*",
     "https://*.sharepoint.com/*"
