@@ -447,7 +447,57 @@
   // SharePoint Stream reuse a handful of class names depending on the
   // surface, so we try several. The Stream page (stream.aspx) is where most
   // tenants serve Teams meeting recordings and their transcripts.
+  // Follow the ARIA tab → panel relationship for Teams v2 (meeting calendar
+  // view). In that view multiple tabpanels coexist (Notes, AI summary,
+  // Mentions, Transcript) and a plain [role="tabpanel"] query hits the first
+  // one in DOM order, which is usually NOT the transcript. Instead we find the
+  // selected tab whose label contains "transcript", then navigate to its
+  // controlled panel via aria-controls, or to the next visible sibling panel
+  // if aria-controls is absent.
+  function findTranscriptTabPanel() {
+    const selectedTab = document.querySelector(
+      '[role="tab"][aria-selected="true"][aria-label*="ranscript" i],' +
+      '[role="tab"][aria-selected="true"][data-tid*="ranscript" i]'
+    );
+    if (!selectedTab) return null;
+
+    const panelId = selectedTab.getAttribute("aria-controls");
+    if (panelId) {
+      const panel = document.getElementById(panelId);
+      if (panel) {
+        console.log("[MeetMark] transcript panel found via aria-controls");
+        return panel;
+      }
+    }
+
+    // Teams sometimes places the tablist and its panels as siblings in a flex
+    // container — walk siblings of the tablist parent to find the first visible
+    // tabpanel.
+    const tablist = selectedTab.closest('[role="tablist"]');
+    if (tablist) {
+      let node = tablist.nextElementSibling;
+      while (node) {
+        const panel = node.matches('[role="tabpanel"]')
+          ? node
+          : node.querySelector('[role="tabpanel"]');
+        if (panel) {
+          console.log("[MeetMark] transcript panel found via tablist sibling");
+          return panel;
+        }
+        node = node.nextElementSibling;
+      }
+    }
+
+    return null;
+  }
+
   function findTranscriptContainer() {
+    // Try the ARIA tab → panel relationship first. This handles Teams v2's
+    // calendar/meeting view where several tabpanels coexist and the plain
+    // [role="tabpanel"] selector would match the wrong one.
+    const viaTabPanel = findTranscriptTabPanel();
+    if (viaTabPanel) return viaTabPanel;
+
     const containerSelectors = [
       // SharePoint Stream (stream.aspx) current transcript panel (2026+).
       // This is the scrollable FocusZone that wraps the ms-List of cells.
@@ -642,12 +692,34 @@
     const existing = findTranscriptContainer();
     if (existing) return { container: existing, opened: false };
 
+    // If the Transcript tab is already selected the panel should be open, but
+    // our container selectors couldn't identify it. Clicking the tab again
+    // would either toggle it closed or — on Teams v2 — accidentally trigger
+    // the transcript-quality feedback widget ("Was this transcript helpful?"),
+    // whose aria-label also contains "ranscript" and matches the broad selector
+    // below. Return early so the caller surfaces a "panel not found" message
+    // instead of firing an unintended click.
+    const alreadySelected = document.querySelector(
+      '[role="tab"][aria-selected="true"][aria-label*="ranscript" i],' +
+      '[role="tab"][aria-selected="true"][data-tid*="ranscript" i]'
+    );
+    if (alreadySelected) {
+      console.log("[MeetMark] transcript tab already selected — skipping button click");
+      return { container: null, opened: false };
+    }
+
+    // Only use role-constrained selectors. The broad `button[aria-label*=
+    // "ranscript"]` (no role) is intentionally removed: it matches Teams'
+    // thumbs-up/down feedback buttons and other widgets that contain the
+    // substring "ranscript" in their accessible name.
     const buttonSelectors = [
+      '[role="tab"][aria-label="Transcript"]',
+      '[role="tab"][aria-label="transcript" i]',
       'button[aria-label="Transcript"][role="menuitem"]',
-      'button[aria-label="Transcript"]',
-      'button[aria-label*="ranscript"][role="menuitem"]',
-      'button[aria-label*="ranscript"]',
       '[role="menuitem"][aria-label="Transcript"]',
+      'button[aria-label="Transcript"]',
+      '[role="tab"][aria-label*="Transcript"]',
+      'button[aria-label*="Transcript"][role="menuitem"]',
     ];
 
     let clicked = false;
