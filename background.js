@@ -103,16 +103,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   try {
     const format = (message.format || "md").toString();
     const saveAs = !!message.saveAs;
-
-    // Build the final filename. When saveAs is false we may prepend an
-    // optional subfolder (relative path within the Downloads directory).
-    const rawFilename = (message.filename || "transcript.md").toString();
-    const subfolder = (message.subfolder || "").toString().trim()
-      .replace(/[\\:*?"<>|]/g, "")  // strip illegal path chars
-      .replace(/^\/+|\/+$/g, "");    // strip leading/trailing slashes
-    const filename = subfolder && !saveAs
-      ? subfolder + "/" + rawFilename
-      : rawFilename;
+    const filename = (message.filename || "transcript.md").toString();
 
     if (format === "pdf") {
       // The "content" is printable HTML — hand it to a new tab for the
@@ -134,8 +125,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       return true;
     }
 
-    // Default: text (md or txt). Base64-encode through a data URL so the
-    // service worker can drive chrome.downloads without Blob support.
+    // Default: text (md or txt).
     const content = (message.content || "").toString();
     const mime = (message.mime || "text/markdown;charset=utf-8").toString();
     const url = buildTextDataUrl(content, mime);

@@ -129,24 +129,38 @@
       margin: 0;
       cursor: pointer;
     }
-    .subfolderRow {
+    .folderRow {
       margin-top: 6px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
     }
-    .subfolderRow input[type="text"] {
-      width: 100%;
-      box-sizing: border-box;
-      padding: 6px 8px;
-      border-radius: 6px;
-      border: 1px solid #c8cad9;
-      font-size: 12px;
-      color: #1f1f1f;
-      background: #fff;
-    }
-    .subfolderRow input[type="text"]::placeholder {
-      color: #9aa0a6;
-    }
-    .subfolderRow.hidden {
+    .folderRow.hidden {
       display: none;
+    }
+    .folderBtn {
+      flex: 0 0 auto;
+      padding: 5px 10px;
+      font-size: 12px;
+      font-weight: 500;
+      border: 1px solid #c8cad9;
+      border-radius: 6px;
+      background: #fff;
+      color: #1f1f1f;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .folderBtn:hover {
+      background: #f1f2fb;
+      border-color: #4b53bc;
+    }
+    .folderName {
+      font-size: 11px;
+      color: #5f6368;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      flex: 1;
     }
     .status {
       margin-top: 14px;
@@ -219,8 +233,9 @@
       <label><input type="radio" name="dlMode" value="auto" id="dlAuto"> Save automatically</label>
       <label><input type="radio" name="dlMode" value="ask" id="dlAsk"> Ask where to save</label>
     </div>
-    <div class="subfolderRow" id="subfolderRow">
-      <input type="text" id="subfolderInput" placeholder="Subfolder in Downloads (optional)" maxlength="80" />
+    <div class="folderRow" id="folderRow">
+      <button class="folderBtn" id="chooseFolderBtn" type="button">Choose folder…</button>
+      <span class="folderName" id="folderName">Default Downloads folder</span>
     </div>
   </div>
 

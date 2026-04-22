@@ -436,9 +436,13 @@
     );
   }
 
-  // Find all position:fixed elements (toolbars, comment boxes, overlays) and
-  // hide them so they don't appear in every captured tile. Returns a list of
-  // {el, visibility} records for restoreHiddenElements().
+  // Hide position:fixed and position:sticky elements so they don't repeat in
+  // every captured tile. Fixed overlays (toolbars, comment boxes, chat widgets)
+  // always appear at the same viewport position regardless of scroll, so they'd
+  // stamp into every tile. Sticky elements (table headers, JIRA nav bars) behave
+  // similarly — they "stick" to the viewport edge in every capture frame.
+  // We set visibility:hidden on both kinds; layout is preserved (no reflow) while
+  // the elements are invisible in the captures. Returns a restore list.
   function hideFixedElements() {
     var hidden = [];
     try {
@@ -452,7 +456,8 @@
         } catch (_) {
           continue;
         }
-        if (cs.position !== "fixed") continue;
+        var pos = cs.position;
+        if (pos !== "fixed" && pos !== "sticky") continue;
         // Skip elements that are already invisible — no need to track them.
         if (cs.display === "none" || cs.visibility === "hidden") continue;
         // Skip zero-size elements (they wouldn't appear in the capture anyway).
