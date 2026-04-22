@@ -9,11 +9,6 @@
     "scripting",
     "storage"
   ],
-  "host_permissions": [
-    "https://teams.microsoft.com/*",
-    "https://*.teams.microsoft.com/*",
-    "https://*.sharepoint.com/*"
-  ],
   "action": {
     "default_title": "MeetMark - Export transcript or capture full page",
     "default_popup": "popup.html",
