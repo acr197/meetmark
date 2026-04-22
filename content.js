@@ -455,10 +455,22 @@
   // controlled panel via aria-controls, or to the next visible sibling panel
   // if aria-controls is absent.
   function findTranscriptTabPanel() {
-    const selectedTab = document.querySelector(
-      '[role="tab"][aria-selected="true"][aria-label*="ranscript" i],' +
-      '[role="tab"][aria-selected="true"][data-tid*="ranscript" i]'
-    );
+    // Fluent UI 2 (Teams v2) tabs expose their accessible name via text
+    // content, not aria-label. Iterate all selected tabs and check both.
+    let selectedTab = null;
+    const selectedTabs = document.querySelectorAll('[role="tab"][aria-selected="true"]');
+    for (const tab of selectedTabs) {
+      const label = (
+        tab.getAttribute("aria-label") ||
+        tab.getAttribute("data-tid") ||
+        tab.textContent ||
+        ""
+      ).toLowerCase();
+      if (label.includes("transcript")) {
+        selectedTab = tab;
+        break;
+      }
+    }
     if (!selectedTab) return null;
 
     const panelId = selectedTab.getAttribute("aria-controls");
@@ -694,24 +706,33 @@
 
     // If the Transcript tab is already selected the panel should be open, but
     // our container selectors couldn't identify it. Clicking the tab again
-    // would either toggle it closed or — on Teams v2 — accidentally trigger
-    // the transcript-quality feedback widget ("Was this transcript helpful?"),
-    // whose aria-label also contains "ranscript" and matches the broad selector
-    // below. Return early so the caller surfaces a "panel not found" message
-    // instead of firing an unintended click.
-    const alreadySelected = document.querySelector(
-      '[role="tab"][aria-selected="true"][aria-label*="ranscript" i],' +
-      '[role="tab"][aria-selected="true"][data-tid*="ranscript" i]'
-    );
+    // would toggle it closed or trigger the Teams feedback widget. Fluent UI 2
+    // tabs (Teams v2) expose their accessible name via textContent, not
+    // aria-label, so we must iterate and inspect both attributes and text.
+    let alreadySelected = false;
+    {
+      const selTabs = document.querySelectorAll('[role="tab"][aria-selected="true"]');
+      for (const tab of selTabs) {
+        const label = (
+          tab.getAttribute("aria-label") ||
+          tab.getAttribute("data-tid") ||
+          tab.textContent ||
+          ""
+        ).toLowerCase();
+        if (label.includes("transcript")) {
+          alreadySelected = true;
+          break;
+        }
+      }
+    }
     if (alreadySelected) {
       console.log("[MeetMark] transcript tab already selected — skipping button click");
       return { container: null, opened: false };
     }
 
-    // Only use role-constrained selectors. The broad `button[aria-label*=
-    // "ranscript"]` (no role) is intentionally removed: it matches Teams'
-    // thumbs-up/down feedback buttons and other widgets that contain the
-    // substring "ranscript" in their accessible name.
+    // Only use role-constrained selectors for the aria-label path. The broad
+    // button[aria-label*="ranscript"] (no role) is intentionally removed: it
+    // matches Teams' thumbs-up/down feedback buttons.
     const buttonSelectors = [
       '[role="tab"][aria-label="Transcript"]',
       '[role="tab"][aria-label="transcript" i]',
@@ -733,6 +754,27 @@
           break;
         } catch (err) {
           console.warn("[MeetMark] click failed: " + err);
+        }
+      }
+    }
+
+    // Text-content fallback: Fluent UI 2 tabs (Teams v2) set the accessible
+    // name via visible text, not aria-label. Scan all tab/menuitem elements
+    // and match by normalised text.
+    if (!clicked) {
+      const navCandidates = document.querySelectorAll('[role="tab"], [role="menuitem"]');
+      for (const btn of navCandidates) {
+        const txt = (btn.getAttribute("aria-label") || btn.textContent || "")
+          .trim().toLowerCase();
+        if (txt === "transcript" || txt.startsWith("transcript")) {
+          console.log("[MeetMark] clicking transcript tab via text-content match");
+          try {
+            btn.click();
+            clicked = true;
+          } catch (err) {
+            console.warn("[MeetMark] click failed: " + err);
+          }
+          break;
         }
       }
     }
