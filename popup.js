@@ -92,7 +92,7 @@ document.addEventListener("DOMContentLoaded", () => {
     }
     if (perm !== "granted") {
       throw new Error(
-        'Permission to the chosen folder was denied. Click "Choose folder…" to reselect it.'
+        'Permission to the chosen folder was denied. Click "Select folder…" to reselect it.'
       );
     }
 
@@ -240,6 +240,20 @@ document.addEventListener("DOMContentLoaded", () => {
     setDetail("");
     setBusy(true, false);
 
+    // Pre-warm the folder permission while the user gesture is still active.
+    // requestPermission() requires a user activation; by the time the
+    // transcript finishes (potentially minutes later) the activation is gone.
+    if (dlMode === "auto" && savedDirHandle) {
+      try {
+        const perm = await savedDirHandle.queryPermission({ mode: "readwrite" });
+        if (perm === "prompt") {
+          await savedDirHandle.requestPermission({ mode: "readwrite" });
+        }
+      } catch (_) {
+        // Non-fatal; handleTranscriptDone will fall back to chrome.downloads.
+      }
+    }
+
     try {
       const [tab] = await chrome.tabs.query({
         active: true,
@@ -327,6 +341,7 @@ document.addEventListener("DOMContentLoaded", () => {
     try {
       let ok = false;
       let errMsg = "";
+      let dirSaveFailed = false;
 
       if (msg.format !== "pdf" && dlMode === "auto" && savedDirHandle) {
         // Write directly to the user's chosen folder.
@@ -334,12 +349,14 @@ document.addEventListener("DOMContentLoaded", () => {
           await saveToDir(savedDirHandle, msg.filename, msg.content, msg.mime);
           ok = true;
         } catch (dirErr) {
+          dirSaveFailed = true;
           errMsg = dirErr && dirErr.message ? dirErr.message : String(dirErr);
         }
       }
 
-      if (!ok && errMsg === "") {
-        // Fall back to chrome.downloads (also used for PDF and "ask" mode).
+      if (!ok) {
+        // Fall back to chrome.downloads (also used for PDF, "ask" mode, and
+        // any folder-write failure so the transcript is never silently lost).
         const downloadResult = await chrome.runtime.sendMessage({
           type: "MEETMARK_DOWNLOAD",
           filename: msg.filename,
@@ -349,7 +366,9 @@ document.addEventListener("DOMContentLoaded", () => {
           saveAs: dlMode === "ask",
         });
         ok = !!(downloadResult && downloadResult.ok);
-        errMsg = (downloadResult && downloadResult.error) || "unknown error";
+        if (!ok) {
+          errMsg = (downloadResult && downloadResult.error) || "unknown error";
+        }
       }
 
       if (ok) {
@@ -357,7 +376,13 @@ document.addEventListener("DOMContentLoaded", () => {
           msg.format === "pdf"
             ? "Opened print-to-PDF view: " + msg.filename
             : "Done. Saved as " + msg.filename;
-        if (msg.warning) {
+        if (dirSaveFailed) {
+          setStatus(
+            "Saved to Downloads (folder permission lost — click Select folder). " +
+              msg.filename,
+            "warn"
+          );
+        } else if (msg.warning) {
           setStatus("Exported with warning: " + msg.warning, "warn");
         } else {
           setStatus(what, "success");
