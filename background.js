@@ -59,7 +59,14 @@ function startDownload(url, filename, saveAs, sendResponse) {
           sendResponse({ ok: false, error: "Download did not start." });
           return;
         }
-        sendResponse({ ok: true, downloadId });
+        // Retrieve the resolved full path so the popup can display it under
+        // "Save automatically". Chrome determines the final filename as soon
+        // as the download starts, so the search result is available here.
+        chrome.downloads.search({ id: downloadId }, (items) => {
+          const dlFile = (items && items[0] && items[0].filename) || "";
+          const downloadDir = dlFile ? dlFile.replace(/[\\/][^\\/]+$/, "") : "";
+          sendResponse({ ok: true, downloadId, downloadDir });
+        });
       }
     );
   } catch (err) {

@@ -36,6 +36,11 @@ document.addEventListener("DOMContentLoaded", () => {
   // Persisted FileSystemDirectoryHandle from showDirectoryPicker(); null = use
   // the browser's default Downloads directory.
   let savedDirHandle = null;
+  // Full directory path captured from the last chrome.downloads save. The
+  // File System Access API (showDirectoryPicker) intentionally hides the
+  // absolute path, so this is populated instead from the chrome.downloads
+  // fallback path which does expose it.
+  let savedDownloadDir = "";
 
   // ---------------------------------------------------------------------------
   // IndexedDB helpers for persisting the FileSystemDirectoryHandle
@@ -108,17 +113,22 @@ document.addEventListener("DOMContentLoaded", () => {
     folderRow.classList.toggle("hidden", mode !== "auto");
   }
 
-  // Load persisted settings.
-  chrome.storage.local.get(["dlMode"], (prefs) => {
+  // Load persisted settings, then load the dir handle so the two never race.
+  chrome.storage.local.get(["dlMode", "savedDownloadDir"], (prefs) => {
     applyDlMode(prefs.dlMode === "ask" ? "ask" : "auto");
-  });
+    savedDownloadDir = prefs.savedDownloadDir || "";
 
-  idbGet("dirHandle").then((handle) => {
-    if (handle && handle.kind === "directory") {
-      savedDirHandle = handle;
-      folderNameEl.textContent = handle.name;
-    }
-  }).catch(() => {});
+    idbGet("dirHandle").then((handle) => {
+      if (handle && handle.kind === "directory") {
+        savedDirHandle = handle;
+        // FSA only provides the folder name; show it.
+        folderNameEl.textContent = handle.name;
+      } else if (savedDownloadDir) {
+        // No FSA handle — show the full path from the last chrome.downloads save.
+        folderNameEl.textContent = savedDownloadDir;
+      }
+    }).catch(() => {});
+  });
 
   dlModeSelect.addEventListener("change", () => {
     applyDlMode(dlModeSelect.value);
@@ -368,6 +378,13 @@ document.addEventListener("DOMContentLoaded", () => {
         ok = !!(downloadResult && downloadResult.ok);
         if (!ok) {
           errMsg = (downloadResult && downloadResult.error) || "unknown error";
+        }
+        // Capture the resolved download directory for the path display. Only
+        // update when no FSA handle is set (FSA takes priority in the UI).
+        if (ok && downloadResult.downloadDir && !savedDirHandle) {
+          savedDownloadDir = downloadResult.downloadDir;
+          chrome.storage.local.set({ savedDownloadDir });
+          folderNameEl.textContent = savedDownloadDir;
         }
       }
 
