@@ -1,7 +1,7 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git -C \"C:/Users/Andrew/Projects/teams-markdown-extension\" remote -v)"
+      "Bash(git -C \"C:/Users/Andrew/Projects/meetmark-extension\" remote -v)"
     ]
   }
 }
