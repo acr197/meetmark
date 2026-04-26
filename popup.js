@@ -26,24 +26,39 @@ document.addEventListener("DOMContentLoaded", () => {
   const detail = document.getElementById("detail");
   const progressBar = document.getElementById("progressBar");
   const progressFill = progressBar.querySelector(".fill");
-  const dlModeSelect = document.getElementById("dlModeSelect");
-  const folderRow = document.getElementById("folderRow");
-  const folderNameEl = document.getElementById("folderName");
+  const dlSegAuto = document.getElementById("dlSegAuto");
+  const dlSegAsk = document.getElementById("dlSegAsk");
+  const folderInfo = document.getElementById("folderInfo");
+  const folderPathEl = document.getElementById("folderPath");
+  const folderHintEl = document.getElementById("folderHint");
   const chooseFolderBtn = document.getElementById("chooseFolderBtn");
 
   // Download preferences: "auto" (default) or "ask".
   let dlMode = "auto";
-  // Persisted FileSystemDirectoryHandle from showDirectoryPicker(); null = use
-  // the browser's default Downloads directory.
+  // FileSystemDirectoryHandle from showDirectoryPicker(). When set, "Save
+  // automatically" writes directly to this folder via the FSA API. Null means
+  // fall back to the browser's default Downloads directory.
   let savedDirHandle = null;
-  // Full directory path captured from the last chrome.downloads save. The
-  // File System Access API (showDirectoryPicker) intentionally hides the
-  // absolute path, so this is populated instead from the chrome.downloads
-  // fallback path which does expose it.
+  // Full directory path from the last chrome.downloads save. Populated after
+  // each chrome.downloads write so the path label stays accurate.
   let savedDownloadDir = "";
 
+  function renderFolderPath() {
+    let label;
+    if (savedDirHandle) {
+      // FSA intentionally hides the absolute path — only the folder name is available.
+      label = "Custom: " + savedDirHandle.name;
+    } else if (savedDownloadDir) {
+      label = savedDownloadDir;
+    } else {
+      label = "Default Downloads folder";
+    }
+    folderPathEl.textContent = label;
+    folderPathEl.title = label;
+  }
+
   // ---------------------------------------------------------------------------
-  // IndexedDB helpers for persisting the FileSystemDirectoryHandle
+  // IndexedDB — persist the FileSystemDirectoryHandle across popup sessions
   // ---------------------------------------------------------------------------
 
   function openSettingsDB() {
@@ -76,11 +91,9 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   // ---------------------------------------------------------------------------
-  // Save-to-folder via File System Access API
+  // FSA write — used when a custom folder has been chosen
   // ---------------------------------------------------------------------------
 
-  // Write content directly to the user's chosen directory without going through
-  // chrome.downloads. content can be a Blob or a string (mime required for string).
   async function saveToDir(handle, filename, content, mime) {
     const blob =
       content instanceof Blob
@@ -89,18 +102,12 @@ document.addEventListener("DOMContentLoaded", () => {
 
     let perm = await handle.queryPermission({ mode: "readwrite" });
     if (perm === "prompt") {
-      try {
-        perm = await handle.requestPermission({ mode: "readwrite" });
-      } catch (_) {
-        perm = "denied";
-      }
+      try { perm = await handle.requestPermission({ mode: "readwrite" }); }
+      catch (_) { perm = "denied"; }
     }
     if (perm !== "granted") {
-      throw new Error(
-        'Permission to the chosen folder was denied. Click "Select folder…" to reselect it.'
-      );
+      throw new Error("Folder permission lost. Click Change to reselect it.");
     }
-
     const fileHandle = await handle.getFileHandle(filename, { create: true });
     const writable = await fileHandle.createWritable();
     await writable.write(blob);
@@ -109,44 +116,50 @@ document.addEventListener("DOMContentLoaded", () => {
 
   function applyDlMode(mode) {
     dlMode = mode;
-    dlModeSelect.value = mode;
-    folderRow.classList.toggle("hidden", mode !== "auto");
+    const isAuto = mode === "auto";
+    dlSegAuto.classList.toggle("active", isAuto);
+    dlSegAsk.classList.toggle("active", !isAuto);
+    dlSegAuto.setAttribute("aria-selected", isAuto ? "true" : "false");
+    dlSegAsk.setAttribute("aria-selected", isAuto ? "false" : "true");
+    folderInfo.classList.toggle("hidden", !isAuto);
+    if (!isAuto) folderHintEl.classList.add("hidden");
   }
 
-  // Load persisted settings, then load the dir handle so the two never race.
   chrome.storage.local.get(["dlMode", "savedDownloadDir"], (prefs) => {
     applyDlMode(prefs.dlMode === "ask" ? "ask" : "auto");
     savedDownloadDir = prefs.savedDownloadDir || "";
-
     idbGet("dirHandle").then((handle) => {
-      if (handle && handle.kind === "directory") {
-        savedDirHandle = handle;
-        // FSA only provides the folder name; show it.
-        folderNameEl.textContent = handle.name;
-      } else if (savedDownloadDir) {
-        // No FSA handle — show the full path from the last chrome.downloads save.
-        folderNameEl.textContent = savedDownloadDir;
-      }
-    }).catch(() => {});
+      if (handle && handle.kind === "directory") savedDirHandle = handle;
+      renderFolderPath();
+    }).catch(() => renderFolderPath());
   });
 
-  dlModeSelect.addEventListener("change", () => {
-    applyDlMode(dlModeSelect.value);
-    chrome.storage.local.set({ dlMode: dlModeSelect.value });
-  });
+  function setMode(mode) {
+    if (mode !== "auto" && mode !== "ask") return;
+    applyDlMode(mode);
+    chrome.storage.local.set({ dlMode: mode });
+  }
+  dlSegAuto.addEventListener("click", () => setMode("auto"));
+  dlSegAsk.addEventListener("click", () => setMode("ask"));
 
   chooseFolderBtn.addEventListener("click", async () => {
+    folderHintEl.classList.add("hidden");
     try {
-      const handle = await window.showDirectoryPicker({
-        id: "meetmark-save",
-        mode: "readwrite",
-      });
+      const handle = await window.showDirectoryPicker({ id: "meetmark-save", mode: "readwrite" });
       savedDirHandle = handle;
-      folderNameEl.textContent = handle.name;
       await idbSet("dirHandle", handle);
+      renderFolderPath();
     } catch (err) {
-      if (err && err.name !== "AbortError") {
-        setStatus("Could not access folder: " + err.message, "warn");
+      if (!err || err.name === "AbortError") {
+        // User cancelled, or Chrome blocked a cloud-synced / system folder.
+        folderHintEl.textContent =
+          "Cloud-synced folders (Drive, iCloud, OneDrive) and system folders " +
+          "can't be selected here. Choose a local folder, or use Ask each time " +
+          "for full control over where each file lands.";
+        folderHintEl.classList.remove("hidden");
+      } else {
+        folderHintEl.textContent = "Could not access folder: " + err.message;
+        folderHintEl.classList.remove("hidden");
       }
     }
   });
@@ -258,6 +271,14 @@ document.addEventListener("DOMContentLoaded", () => {
     setBusy(false);
   }
 
+  // Close the popup a few seconds after a successful download so Chrome's
+  // download notification doesn't land on top of an open popup.
+  let autoCloseTimer = null;
+  function scheduleAutoClose() {
+    if (autoCloseTimer) clearTimeout(autoCloseTimer);
+    autoCloseTimer = setTimeout(() => window.close(), 4000);
+  }
+
   // ---------------------------------------------------------------------------
   // Transcript flows (Quick Grab + Grab as MD/TXT/PDF)
   // ---------------------------------------------------------------------------
@@ -267,18 +288,13 @@ document.addEventListener("DOMContentLoaded", () => {
     setDetail("");
     setBusy(true, false);
 
-    // Pre-warm the folder permission while the user gesture is still active.
-    // requestPermission() requires a user activation; by the time the
-    // transcript finishes (potentially minutes later) the activation is gone.
+    // Pre-warm the FSA permission while the user gesture is still live.
+    // requestPermission() needs user activation; the transcript may take minutes.
     if (dlMode === "auto" && savedDirHandle) {
       try {
         const perm = await savedDirHandle.queryPermission({ mode: "readwrite" });
-        if (perm === "prompt") {
-          await savedDirHandle.requestPermission({ mode: "readwrite" });
-        }
-      } catch (_) {
-        // Non-fatal; handleTranscriptDone will fall back to chrome.downloads.
-      }
+        if (perm === "prompt") await savedDirHandle.requestPermission({ mode: "readwrite" });
+      } catch (_) {}
     }
 
     try {
@@ -368,23 +384,20 @@ document.addEventListener("DOMContentLoaded", () => {
     try {
       let ok = false;
       let errMsg = "";
-      let dirSaveFailed = false;
       let lastDownloadId = null;
+      let usedFsa = false;
 
       if (msg.format !== "pdf" && dlMode === "auto" && savedDirHandle) {
-        // Write directly to the user's chosen folder.
         try {
           await saveToDir(savedDirHandle, msg.filename, msg.content, msg.mime);
           ok = true;
+          usedFsa = true;
         } catch (dirErr) {
-          dirSaveFailed = true;
           errMsg = dirErr && dirErr.message ? dirErr.message : String(dirErr);
         }
       }
 
       if (!ok) {
-        // Fall back to chrome.downloads (also used for PDF, "ask" mode, and
-        // any folder-write failure so the transcript is never silently lost).
         const downloadResult = await chrome.runtime.sendMessage({
           type: "MEETMARK_DOWNLOAD",
           filename: msg.filename,
@@ -396,15 +409,12 @@ document.addEventListener("DOMContentLoaded", () => {
         ok = !!(downloadResult && downloadResult.ok);
         if (!ok) {
           errMsg = (downloadResult && downloadResult.error) || "unknown error";
-        }
-        if (ok) {
+        } else {
           lastDownloadId = (downloadResult.downloadId != null) ? downloadResult.downloadId : null;
-          // Capture the resolved download directory for the path display. Only
-          // update when no FSA handle is set (FSA takes priority in the UI).
           if (downloadResult.downloadDir && !savedDirHandle) {
             savedDownloadDir = downloadResult.downloadDir;
             chrome.storage.local.set({ savedDownloadDir });
-            folderNameEl.textContent = savedDownloadDir;
+            renderFolderPath();
           }
         }
       }
@@ -414,24 +424,19 @@ document.addEventListener("DOMContentLoaded", () => {
           msg.format === "pdf"
             ? "Opened print-to-PDF view: " + msg.filename
             : "Done. Saved as " + msg.filename;
-        if (dirSaveFailed) {
-          setStatus(
-            "Saved to Downloads (folder permission lost — click Select folder). " +
-              msg.filename,
-            "warn"
-          );
-        } else if (msg.warning) {
+        if (msg.warning) {
           setStatus("Exported with warning: " + msg.warning, "warn");
         } else {
           setStatus(what, "success");
         }
-        appendRevealLink(lastDownloadId);
+        if (!usedFsa) appendRevealLink(lastDownloadId);
         setDetail(
           (msg.turnCount ? msg.turnCount + " turns exported" : "") +
             (msg.speakerCount
               ? (msg.turnCount ? ", " : "") + msg.speakerCount + " speakers"
               : "")
         );
+        scheduleAutoClose();
       } else {
         setStatus("Download failed: " + errMsg, "error");
       }
@@ -746,6 +751,7 @@ document.addEventListener("DOMContentLoaded", () => {
           );
           appendRevealLink(lastDownloadId);
           setDetail(pageWidthPx + " × " + pageHeightPx + " pixels");
+          scheduleAutoClose();
         } else if (savedCount > 0) {
           setStatus(
             "Saved " +
