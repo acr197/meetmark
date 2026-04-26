@@ -161,6 +161,23 @@ document.addEventListener("DOMContentLoaded", () => {
     status.className = "status " + (level || "info");
   }
 
+  // Appends a "Show in folder" link to the status div when a download ID is
+  // available (chrome.downloads path only — FSA writes have no download ID).
+  function appendRevealLink(downloadId) {
+    if (downloadId == null) return;
+    const sep = document.createTextNode(" — ");
+    const link = document.createElement("a");
+    link.className = "reveal-link";
+    link.href = "#";
+    link.textContent = "Show in folder";
+    link.addEventListener("click", (e) => {
+      e.preventDefault();
+      chrome.downloads.show(downloadId);
+    });
+    status.appendChild(sep);
+    status.appendChild(link);
+  }
+
   function setDetail(text) {
     detail.textContent = text || "";
   }
@@ -352,6 +369,7 @@ document.addEventListener("DOMContentLoaded", () => {
       let ok = false;
       let errMsg = "";
       let dirSaveFailed = false;
+      let lastDownloadId = null;
 
       if (msg.format !== "pdf" && dlMode === "auto" && savedDirHandle) {
         // Write directly to the user's chosen folder.
@@ -379,12 +397,15 @@ document.addEventListener("DOMContentLoaded", () => {
         if (!ok) {
           errMsg = (downloadResult && downloadResult.error) || "unknown error";
         }
-        // Capture the resolved download directory for the path display. Only
-        // update when no FSA handle is set (FSA takes priority in the UI).
-        if (ok && downloadResult.downloadDir && !savedDirHandle) {
-          savedDownloadDir = downloadResult.downloadDir;
-          chrome.storage.local.set({ savedDownloadDir });
-          folderNameEl.textContent = savedDownloadDir;
+        if (ok) {
+          lastDownloadId = (downloadResult.downloadId != null) ? downloadResult.downloadId : null;
+          // Capture the resolved download directory for the path display. Only
+          // update when no FSA handle is set (FSA takes priority in the UI).
+          if (downloadResult.downloadDir && !savedDirHandle) {
+            savedDownloadDir = downloadResult.downloadDir;
+            chrome.storage.local.set({ savedDownloadDir });
+            folderNameEl.textContent = savedDownloadDir;
+          }
         }
       }
 
@@ -404,6 +425,7 @@ document.addEventListener("DOMContentLoaded", () => {
         } else {
           setStatus(what, "success");
         }
+        appendRevealLink(lastDownloadId);
         setDetail(
           (msg.turnCount ? msg.turnCount + " turns exported" : "") +
             (msg.speakerCount
@@ -680,6 +702,7 @@ document.addEventListener("DOMContentLoaded", () => {
         const multi = screenshots.length > 1;
         let savedCount = 0;
         let lastError = "";
+        let lastDownloadId = null;
 
         for (let i = 0; i < screenshots.length; i++) {
           const filename = multi
@@ -706,6 +729,7 @@ document.addEventListener("DOMContentLoaded", () => {
             });
             if (dl && dl.ok) {
               savedCount++;
+              lastDownloadId = (dl.downloadId != null) ? dl.downloadId : null;
             } else {
               lastError = (dl && dl.error) || "unknown error";
             }
@@ -720,6 +744,7 @@ document.addEventListener("DOMContentLoaded", () => {
               : "Done. Saved full-page PNG.",
             "success"
           );
+          appendRevealLink(lastDownloadId);
           setDetail(pageWidthPx + " × " + pageHeightPx + " pixels");
         } else if (savedCount > 0) {
           setStatus(
