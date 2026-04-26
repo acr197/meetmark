@@ -30,88 +30,17 @@ document.addEventListener("DOMContentLoaded", () => {
   const dlSegAsk = document.getElementById("dlSegAsk");
   const folderInfo = document.getElementById("folderInfo");
   const folderPathEl = document.getElementById("folderPath");
-  const folderHintEl = document.getElementById("folderHint");
-  const chooseFolderBtn = document.getElementById("chooseFolderBtn");
 
   // Download preferences: "auto" (default) or "ask".
   let dlMode = "auto";
-  // FileSystemDirectoryHandle from showDirectoryPicker(). When set, "Save
-  // automatically" writes directly to this folder via the FSA API. Null means
-  // fall back to the browser's default Downloads directory.
-  let savedDirHandle = null;
-  // Full directory path from the last chrome.downloads save. Populated after
-  // each chrome.downloads write so the path label stays accurate.
+  // Full directory path from the last chrome.downloads save. Updated after
+  // each successful save so the label reflects the real location.
   let savedDownloadDir = "";
 
   function renderFolderPath() {
-    let label;
-    if (savedDirHandle) {
-      // FSA intentionally hides the absolute path — only the folder name is available.
-      label = "Custom: " + savedDirHandle.name;
-    } else if (savedDownloadDir) {
-      label = savedDownloadDir;
-    } else {
-      label = "Default Downloads folder";
-    }
+    const label = savedDownloadDir || "Saves to your Downloads folder";
     folderPathEl.textContent = label;
     folderPathEl.title = label;
-  }
-
-  // ---------------------------------------------------------------------------
-  // IndexedDB — persist the FileSystemDirectoryHandle across popup sessions
-  // ---------------------------------------------------------------------------
-
-  function openSettingsDB() {
-    return new Promise((resolve, reject) => {
-      const req = indexedDB.open("meetmark-settings", 1);
-      req.onupgradeneeded = () => req.result.createObjectStore("kv");
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
-  }
-
-  async function idbGet(key) {
-    const db = await openSettingsDB();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction("kv", "readonly");
-      const req = tx.objectStore("kv").get(key);
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
-  }
-
-  async function idbSet(key, value) {
-    const db = await openSettingsDB();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction("kv", "readwrite");
-      tx.objectStore("kv").put(value, key);
-      tx.oncomplete = resolve;
-      tx.onerror = () => reject(tx.error);
-    });
-  }
-
-  // ---------------------------------------------------------------------------
-  // FSA write — used when a custom folder has been chosen
-  // ---------------------------------------------------------------------------
-
-  async function saveToDir(handle, filename, content, mime) {
-    const blob =
-      content instanceof Blob
-        ? content
-        : new Blob([content], { type: mime || "application/octet-stream" });
-
-    let perm = await handle.queryPermission({ mode: "readwrite" });
-    if (perm === "prompt") {
-      try { perm = await handle.requestPermission({ mode: "readwrite" }); }
-      catch (_) { perm = "denied"; }
-    }
-    if (perm !== "granted") {
-      throw new Error("Folder permission lost. Click Change to reselect it.");
-    }
-    const fileHandle = await handle.getFileHandle(filename, { create: true });
-    const writable = await fileHandle.createWritable();
-    await writable.write(blob);
-    await writable.close();
   }
 
   function applyDlMode(mode) {
@@ -122,16 +51,12 @@ document.addEventListener("DOMContentLoaded", () => {
     dlSegAuto.setAttribute("aria-selected", isAuto ? "true" : "false");
     dlSegAsk.setAttribute("aria-selected", isAuto ? "false" : "true");
     folderInfo.classList.toggle("hidden", !isAuto);
-    if (!isAuto) folderHintEl.classList.add("hidden");
   }
 
   chrome.storage.local.get(["dlMode", "savedDownloadDir"], (prefs) => {
     applyDlMode(prefs.dlMode === "ask" ? "ask" : "auto");
     savedDownloadDir = prefs.savedDownloadDir || "";
-    idbGet("dirHandle").then((handle) => {
-      if (handle && handle.kind === "directory") savedDirHandle = handle;
-      renderFolderPath();
-    }).catch(() => renderFolderPath());
+    renderFolderPath();
   });
 
   function setMode(mode) {
@@ -141,28 +66,6 @@ document.addEventListener("DOMContentLoaded", () => {
   }
   dlSegAuto.addEventListener("click", () => setMode("auto"));
   dlSegAsk.addEventListener("click", () => setMode("ask"));
-
-  chooseFolderBtn.addEventListener("click", async () => {
-    folderHintEl.classList.add("hidden");
-    try {
-      const handle = await window.showDirectoryPicker({ id: "meetmark-save", mode: "readwrite" });
-      savedDirHandle = handle;
-      await idbSet("dirHandle", handle);
-      renderFolderPath();
-    } catch (err) {
-      if (!err || err.name === "AbortError") {
-        // User cancelled, or Chrome blocked a cloud-synced / system folder.
-        folderHintEl.textContent =
-          "Cloud-synced folders (Drive, iCloud, OneDrive) and system folders " +
-          "can't be selected here. Choose a local folder, or use Ask each time " +
-          "for full control over where each file lands.";
-        folderHintEl.classList.remove("hidden");
-      } else {
-        folderHintEl.textContent = "Could not access folder: " + err.message;
-        folderHintEl.classList.remove("hidden");
-      }
-    }
-  });
 
   // Exactly one of these is active at a time. The cancel button talks to
   // whichever is set.
@@ -288,15 +191,6 @@ document.addEventListener("DOMContentLoaded", () => {
     setDetail("");
     setBusy(true, false);
 
-    // Pre-warm the FSA permission while the user gesture is still live.
-    // requestPermission() needs user activation; the transcript may take minutes.
-    if (dlMode === "auto" && savedDirHandle) {
-      try {
-        const perm = await savedDirHandle.queryPermission({ mode: "readwrite" });
-        if (perm === "prompt") await savedDirHandle.requestPermission({ mode: "readwrite" });
-      } catch (_) {}
-    }
-
     try {
       const [tab] = await chrome.tabs.query({
         active: true,
@@ -382,44 +276,22 @@ document.addEventListener("DOMContentLoaded", () => {
     setStatus("Converting and downloading...", "info");
     setDetail("");
     try {
-      let ok = false;
-      let errMsg = "";
-      let lastDownloadId = null;
-      let usedFsa = false;
-
-      if (msg.format !== "pdf" && dlMode === "auto" && savedDirHandle) {
-        try {
-          await saveToDir(savedDirHandle, msg.filename, msg.content, msg.mime);
-          ok = true;
-          usedFsa = true;
-        } catch (dirErr) {
-          errMsg = dirErr && dirErr.message ? dirErr.message : String(dirErr);
-        }
-      }
-
-      if (!ok) {
-        const downloadResult = await chrome.runtime.sendMessage({
-          type: "MEETMARK_DOWNLOAD",
-          filename: msg.filename,
-          content: msg.content,
-          mime: msg.mime,
-          format: msg.format,
-          saveAs: dlMode === "ask",
-        });
-        ok = !!(downloadResult && downloadResult.ok);
-        if (!ok) {
-          errMsg = (downloadResult && downloadResult.error) || "unknown error";
-        } else {
-          lastDownloadId = (downloadResult.downloadId != null) ? downloadResult.downloadId : null;
-          if (downloadResult.downloadDir && !savedDirHandle) {
-            savedDownloadDir = downloadResult.downloadDir;
-            chrome.storage.local.set({ savedDownloadDir });
-            renderFolderPath();
-          }
-        }
-      }
-
+      const downloadResult = await chrome.runtime.sendMessage({
+        type: "MEETMARK_DOWNLOAD",
+        filename: msg.filename,
+        content: msg.content,
+        mime: msg.mime,
+        format: msg.format,
+        saveAs: dlMode === "ask",
+      });
+      const ok = !!(downloadResult && downloadResult.ok);
       if (ok) {
+        const lastDownloadId = (downloadResult.downloadId != null) ? downloadResult.downloadId : null;
+        if (downloadResult.downloadDir) {
+          savedDownloadDir = downloadResult.downloadDir;
+          chrome.storage.local.set({ savedDownloadDir });
+          renderFolderPath();
+        }
         const what =
           msg.format === "pdf"
             ? "Opened print-to-PDF view: " + msg.filename
@@ -429,7 +301,7 @@ document.addEventListener("DOMContentLoaded", () => {
         } else {
           setStatus(what, "success");
         }
-        if (!usedFsa) appendRevealLink(lastDownloadId);
+        appendRevealLink(lastDownloadId);
         setDetail(
           (msg.turnCount ? msg.turnCount + " turns exported" : "") +
             (msg.speakerCount
@@ -438,6 +310,7 @@ document.addEventListener("DOMContentLoaded", () => {
         );
         scheduleAutoClose();
       } else {
+        const errMsg = (downloadResult && downloadResult.error) || "unknown error";
         setStatus("Download failed: " + errMsg, "error");
       }
     } catch (err) {
@@ -714,30 +587,20 @@ document.addEventListener("DOMContentLoaded", () => {
             ? base + "-part-" + (i + 1) + "-of-" + screenshots.length + ".png"
             : base + ".png";
           const blob = await canvasToBlob(screenshots[i].canvas);
-
-          if (dlMode === "auto" && savedDirHandle) {
-            try {
-              await saveToDir(savedDirHandle, filename, blob, "image/png");
-              savedCount++;
-            } catch (dirErr) {
-              lastError = dirErr && dirErr.message ? dirErr.message : String(dirErr);
-            }
+          const dataUrl = await blobToDataUrl(blob);
+          const dl = await chrome.runtime.sendMessage({
+            type: "MEETMARK_DOWNLOAD",
+            filename,
+            dataUrl,
+            mime: "image/png",
+            format: "png",
+            saveAs: dlMode === "ask",
+          });
+          if (dl && dl.ok) {
+            savedCount++;
+            lastDownloadId = (dl.downloadId != null) ? dl.downloadId : null;
           } else {
-            const dataUrl = await blobToDataUrl(blob);
-            const dl = await chrome.runtime.sendMessage({
-              type: "MEETMARK_DOWNLOAD",
-              filename,
-              dataUrl,
-              mime: "image/png",
-              format: "png",
-              saveAs: dlMode === "ask",
-            });
-            if (dl && dl.ok) {
-              savedCount++;
-              lastDownloadId = (dl.downloadId != null) ? dl.downloadId : null;
-            } else {
-              lastError = (dl && dl.error) || "unknown error";
-            }
+            lastError = (dl && dl.error) || "unknown error";
           }
         }
 

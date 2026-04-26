@@ -13,10 +13,8 @@
       --accent: #3D7575;
       --accent-hover: #2C5858;
       --accent-tint: #EAF1F1;
-      --code-bg: #EDEDEF;
       --success: #3A7A4A;
       --negative: #9B3A3A;
-      --info: #3060A0;
       --warning: #A07A20;
     }
     * { box-sizing: border-box; }
@@ -134,11 +132,10 @@
     }
     .dlSegment {
       display: flex;
-      gap: 0;
       border: 1px solid var(--border);
       border-radius: 6px;
       overflow: hidden;
-      margin-bottom: 8px;
+      margin-bottom: 6px;
     }
     .dlSeg {
       flex: 1 1 0;
@@ -163,17 +160,13 @@
       color: #ffffff;
     }
     .folderInfo {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      padding: 5px 0 0;
+      padding: 2px 0 0;
     }
     .folderInfo.hidden {
       display: none;
     }
     .folderPath {
-      flex: 1 1 auto;
-      min-width: 0;
+      display: block;
       font-size: 11px;
       color: var(--muted);
       font-family: "JetBrains Mono", "IBM Plex Mono", Menlo, Consolas, monospace;
@@ -182,32 +175,6 @@
       white-space: nowrap;
       direction: rtl;
       text-align: left;
-    }
-    .folderBtn {
-      flex: 0 0 auto;
-      padding: 4px 9px;
-      font-size: 11px;
-      font-weight: 500;
-      border: 1px solid var(--border);
-      border-radius: 4px;
-      background: #ffffff;
-      color: var(--ink);
-      cursor: pointer;
-      white-space: nowrap;
-      font-family: inherit;
-    }
-    .folderBtn:hover {
-      background: var(--accent-tint);
-      border-color: var(--accent);
-    }
-    .folderHint {
-      margin-top: 6px;
-      font-size: 10px;
-      color: var(--muted);
-      line-height: 1.5;
-    }
-    .folderHint.hidden {
-      display: none;
     }
     .status {
       margin-top: 14px;
@@ -283,14 +250,12 @@
   <div class="settingsSection">
     <div class="sectionLabel">Save downloads</div>
     <div class="dlSegment" role="tablist" aria-label="Download mode">
-      <button class="dlSeg active" id="dlSegAuto" data-mode="auto" type="button" role="tab" aria-selected="true">Save automatically</button>
-      <button class="dlSeg" id="dlSegAsk" data-mode="ask" type="button" role="tab" aria-selected="false">Ask each time</button>
+      <button class="dlSeg active" id="dlSegAuto" type="button" role="tab" aria-selected="true">Save automatically</button>
+      <button class="dlSeg" id="dlSegAsk" type="button" role="tab" aria-selected="false">Ask each time</button>
     </div>
     <div class="folderInfo" id="folderInfo">
-      <span class="folderPath" id="folderPath" title="Default Downloads folder">Default Downloads folder</span>
-      <button class="folderBtn" id="chooseFolderBtn" type="button">Change…</button>
+      <span class="folderPath" id="folderPath" title="Saves to your Downloads folder">Saves to your Downloads folder</span>
     </div>
-    <div class="folderHint hidden" id="folderHint"></div>
   </div>
 
   <div class="progressBar" id="progressBar"><div class="fill"></div></div>
