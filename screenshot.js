@@ -22,11 +22,9 @@
   }
   window.__meetmarkShotLoaded = true;
 
-  // Matches GoFullPage's CAPTURE_DELAY. Chrome throttles
-  // chrome.tabs.captureVisibleTab to roughly 2 calls per second — the popup
-  // serializes captures with the port ack, so this mainly controls how long
-  // we pause after a scroll for Fluent / React / virtualized UIs to lay out.
-  var CAPTURE_DELAY = 250;
+  // Minimum post-scroll pause before capturing. 300 ms is required to let
+  // React / Fluent / virtualized layouts repaint after a programmatic scroll.
+  var CAPTURE_DELAY = 300;
 
   // Pad the vertical scroll to overlap sticky headers. 200 is the value
   // GoFullPage uses.
@@ -241,9 +239,8 @@
         var x = next[0],
           y = next[1];
 
-        scrollTo(target, x, y);
+        await scrollToAndWait(target, x, y);
 
-        await delay(CAPTURE_DELAY);
         if (cancelled) {
           if (cleanUp && !cleanedUp) {
             try {
@@ -322,62 +319,44 @@
     }
   });
 
-  // Pick the scrollable target. Prefer the window when the document root
-  // actually scrolls; otherwise find the largest scrollable descendant.
+  // Pick the scrollable target. If an inner element has taller scrollable
+  // content than the document root, use it; otherwise drive the window.
   function pickScrollTarget() {
     var docEl = document.documentElement;
     var body = document.body;
+
+    var inner = findTallestInnerScroller();
+
+    var rootScrollHeight = Math.max(
+      docEl.scrollHeight,
+      body ? body.scrollHeight : 0
+    );
+    var innerScrollHeight = inner ? inner.scrollHeight : 0;
+
     var rootScrolls =
-      (docEl.scrollHeight > docEl.clientHeight + 1 ||
-        docEl.scrollWidth > docEl.clientWidth + 1) ||
-      (body &&
-        (body.scrollHeight > body.clientHeight + 1 ||
-          body.scrollWidth > body.clientWidth + 1));
+      docEl.scrollHeight > docEl.clientHeight + 1 ||
+      (body && body.scrollHeight > body.clientHeight + 1);
 
-    var inner = findBiggestInnerScroller();
-
-    // Choose the one with more hidden content. Inner wins if it dwarfs the
-    // window (the dashboard case), window wins for normal pages.
-    var rootArea = 0;
-    if (rootScrolls) {
-      var w = Math.max(docEl.scrollWidth, body ? body.scrollWidth : 0);
-      var h = Math.max(docEl.scrollHeight, body ? body.scrollHeight : 0);
-      rootArea = w * h;
-    }
-    var innerArea = inner ? inner.scrollWidth * inner.scrollHeight : 0;
-
-    if (innerArea > rootArea * 1.1 && inner) {
+    // Inner wins when it has meaningfully more hidden content than the root,
+    // or when the root doesn't actually scroll (overflow:hidden dashboards).
+    if (inner && (!rootScrolls || innerScrollHeight > rootScrollHeight * 1.1)) {
       return { mode: "element", el: inner };
     }
     return { mode: "window", el: null };
   }
 
-  function findBiggestInnerScroller() {
-    var best = null;
-    var bestArea = 0;
+  // Walk the DOM and collect all vertically scrollable elements (overflow
+  // auto/scroll, scrollHeight > clientHeight). Pick the tallest one; if two
+  // candidates are within 20% of each other, prefer the one whose horizontal
+  // midpoint is closest to the viewport center (content wells beat sidebars).
+  function findTallestInnerScroller() {
+    var candidates = [];
     var nodes = document.querySelectorAll("*");
     for (var i = 0; i < nodes.length; i++) {
       var el = nodes[i];
       if (el === document.documentElement || el === document.body) continue;
 
-      // Cheap size check first — elements smaller than half the viewport
-      // in either axis are almost never the page's main scroller.
-      var rect;
-      try {
-        rect = el.getBoundingClientRect();
-      } catch (_) {
-        continue;
-      }
-      if (
-        rect.width < window.innerWidth * 0.4 ||
-        rect.height < window.innerHeight * 0.4
-      ) {
-        continue;
-      }
-
-      var scrollsY = el.scrollHeight > el.clientHeight + 1;
-      var scrollsX = el.scrollWidth > el.clientWidth + 1;
-      if (!scrollsY && !scrollsX) continue;
+      if (el.scrollHeight <= el.clientHeight + 1) continue;
 
       var cs;
       try {
@@ -386,31 +365,105 @@
         continue;
       }
       var oy = cs.overflowY;
-      var ox = cs.overflowX;
-      var canScroll =
-        oy === "auto" ||
-        oy === "scroll" ||
-        oy === "overlay" ||
-        ox === "auto" ||
-        ox === "scroll" ||
-        ox === "overlay";
-      if (!canScroll) continue;
+      if (oy !== "auto" && oy !== "scroll" && oy !== "overlay") continue;
 
-      var area = el.scrollWidth * el.scrollHeight;
-      if (area > bestArea) {
-        bestArea = area;
-        best = el;
+      var rect;
+      try {
+        rect = el.getBoundingClientRect();
+      } catch (_) {
+        continue;
       }
+      // Skip elements narrower/shorter than 40% of the viewport — sidebars
+      // and tooltip containers are never the main content well.
+      if (
+        rect.width < window.innerWidth * 0.4 ||
+        rect.height < window.innerHeight * 0.4
+      ) {
+        continue;
+      }
+
+      candidates.push({ el: el, scrollHeight: el.scrollHeight, rect: rect });
     }
-    return best;
+
+    if (candidates.length === 0) return null;
+
+    // Sort tallest first.
+    candidates.sort(function (a, b) {
+      return b.scrollHeight - a.scrollHeight;
+    });
+
+    // Among candidates within 20% of the tallest, prefer the one whose
+    // midpoint is closest to the horizontal center of the viewport.
+    var topHeight = candidates[0].scrollHeight;
+    var similar = candidates.filter(function (c) {
+      return c.scrollHeight >= topHeight * 0.8;
+    });
+
+    var chosen;
+    if (similar.length > 1) {
+      var centerX = window.innerWidth / 2;
+      chosen = similar.reduce(function (a, b) {
+        var aMid = a.rect.left + a.rect.width / 2;
+        var bMid = b.rect.left + b.rect.width / 2;
+        return Math.abs(aMid - centerX) <= Math.abs(bMid - centerX) ? a : b;
+      });
+    } else {
+      chosen = candidates[0];
+    }
+
+    var cls =
+      typeof chosen.el.className === "string"
+        ? chosen.el.className.trim() || "(none)"
+        : "(none)";
+    console.log(
+      "[MeetMark] scroll target selected:",
+      chosen.el.tagName,
+      "id=" + (chosen.el.id || "(none)"),
+      "class=" + cls,
+      "scrollHeight=" + chosen.scrollHeight
+    );
+
+    return chosen.el;
   }
 
-  function scrollTo(target, x, y) {
+  // Scroll the target to (x, y) using incremental scrollTop += delta so that
+  // SPAs that ignore absolute assignments still advance. After commanding the
+  // scroll, poll until the position stabilises (minimum 300 ms). If the
+  // element doesn't reach the target position, pause 800 ms and retry once.
+  async function scrollToAndWait(target, x, y) {
     if (target.mode === "window") {
       window.scrollTo(x, y);
-    } else {
-      target.el.scrollLeft = x;
-      target.el.scrollTop = y;
+      await delay(CAPTURE_DELAY);
+      return;
+    }
+    var el = target.el;
+    var prevTop = el.scrollTop;
+    var deltaY = y - prevTop;
+    el.scrollLeft = x;
+    el.scrollTop += deltaY;
+
+    await waitForScrollStable(el, CAPTURE_DELAY, 600);
+
+    // Stall detection: if the element didn't reach the target, retry once.
+    if (Math.abs(el.scrollTop - y) > 5) {
+      await delay(800);
+      el.scrollTop += y - el.scrollTop;
+      await waitForScrollStable(el, CAPTURE_DELAY, 600);
+    }
+  }
+
+  // Poll el.scrollTop every 50 ms until it stops changing, waiting at least
+  // minMs and giving up after maxMs.
+  async function waitForScrollStable(el, minMs, maxMs) {
+    var start = Date.now();
+    var last = el.scrollTop;
+    while (true) {
+      await delay(50);
+      var elapsed = Date.now() - start;
+      var cur = el.scrollTop;
+      if (cur === last && elapsed >= minMs) break;
+      if (elapsed >= maxMs) break;
+      last = cur;
     }
   }
 
