@@ -29,3 +29,8 @@ Transcript scraper targets SharePoint Stream only (`*.sharepoint.com`). Full-pag
 ## Versioning
 
 Follow global CLAUDE.md rules: bump `manifest.json` `version` on every commit. Minor fix = 0.0.1 bump, new feature = 0.1 bump.
+
+## Git / GitHub output rules
+
+- **Never** include a Claude Code session URL (e.g. `https://claude.ai/code/session_...`) in commit messages, PR titles, PR bodies, or any GitHub comment.
+- **Never** wrap MCP tool parameters in shell heredoc syntax (`$(cat <<'EOF' ... EOF)`). MCP tools receive their arguments as plain strings — pass the body/message text directly as a JSON string value. The heredoc wrapper is only appropriate when constructing a shell command via the Bash tool.

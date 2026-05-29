@@ -22,9 +22,9 @@
   }
   window.__meetmarkShotLoaded = true;
 
-  // Minimum post-scroll pause before capturing. 300 ms is required to let
-  // React / Fluent / virtualized layouts repaint after a programmatic scroll.
-  var CAPTURE_DELAY = 300;
+  // Minimum post-scroll pause before capturing. 400 ms gives virtualized grids
+  // (e.g. Smartsheet) enough time to update row transforms after a scroll event.
+  var CAPTURE_DELAY = 400;
 
   // Pad the vertical scroll to overlap sticky headers. 200 is the value
   // GoFullPage uses.
@@ -428,8 +428,9 @@
 
   // Scroll the target to (x, y) using incremental scrollTop += delta so that
   // SPAs that ignore absolute assignments still advance. After commanding the
-  // scroll, poll until the position stabilises (minimum 300 ms). If the
-  // element doesn't reach the target position, pause 800 ms and retry once.
+  // scroll, poll until the position stabilises, then wait for two animation
+  // frames so virtualized grids (which update row transforms inside rAF
+  // callbacks) have completed their repaint before we capture.
   async function scrollToAndWait(target, x, y) {
     if (target.mode === "window") {
       window.scrollTo(x, y);
@@ -442,14 +443,22 @@
     el.scrollLeft = x;
     el.scrollTop += deltaY;
 
-    await waitForScrollStable(el, CAPTURE_DELAY, 600);
+    await waitForScrollStable(el, CAPTURE_DELAY, 800);
+    // Double-rAF: first frame lets the scroll event handler run; second
+    // frame lets any follow-up layout / transform update flush to the GPU.
+    await waitForRaf();
 
     // Stall detection: if the element didn't reach the target, retry once.
-    if (Math.abs(el.scrollTop - y) > 5) {
+    var reached = el.scrollTop;
+    if (Math.abs(reached - y) > 5) {
+      console.log("[MeetMark] scroll stalled at", reached, "(target " + y + "), retrying");
       await delay(800);
       el.scrollTop += y - el.scrollTop;
-      await waitForScrollStable(el, CAPTURE_DELAY, 600);
+      await waitForScrollStable(el, CAPTURE_DELAY, 800);
+      await waitForRaf();
     }
+
+    console.log("[MeetMark] scrollTop=" + el.scrollTop + " (target " + y + ")");
   }
 
   // Poll el.scrollTop every 50 ms until it stops changing, waiting at least
@@ -465,6 +474,15 @@
       if (elapsed >= maxMs) break;
       last = cur;
     }
+  }
+
+  // Wait for two animation frames so all rAF-driven render work flushes.
+  function waitForRaf() {
+    return new Promise(function (resolve) {
+      requestAnimationFrame(function () {
+        requestAnimationFrame(resolve);
+      });
+    });
   }
 
   function readScroll(target) {
