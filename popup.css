@@ -1,0 +1,379 @@
+/* MeetMark popup + side panel styles. Shared by popup.html and sidebar.html
+   so both surfaces render the same UI. tokens.css is linked first; this file
+   sets the local color tokens and component styles. */
+
+    :root {
+      color-scheme: light;
+      --canvas: #F4F5F4;
+      --ink: #141414;
+      --muted: #5E5E5E;
+      --border: #E0E2E0;
+      --accent: #3D7575;
+      --accent-hover: #2C5858;
+      --accent-tint: #EAF1F1;
+      --success: #3A7A4A;
+      --negative: #9B3A3A;
+      --warning: #A07A20;
+      --field-bg: #ffffff;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]) {
+        color-scheme: dark;
+        --canvas: #141414;
+        --ink: #EBEBEB;
+        --muted: #9A9A9A;
+        --border: #252525;
+        --accent: #5FA8A8;
+        --accent-hover: #7DBFBF;
+        --accent-tint: #1E2A2A;
+        --success: #5FA86F;
+        --negative: #C46A6A;
+        --warning: #C2A24A;
+        --field-bg: #1C1C1C;
+      }
+    }
+    [data-theme="dark"] {
+      color-scheme: dark;
+      --canvas: #141414;
+      --ink: #EBEBEB;
+      --muted: #9A9A9A;
+      --border: #252525;
+      --accent: #5FA8A8;
+      --accent-hover: #7DBFBF;
+      --accent-tint: #1E2A2A;
+      --success: #5FA86F;
+      --negative: #C46A6A;
+      --warning: #C2A24A;
+      --field-bg: #1C1C1C;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: "DM Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      width: 320px;
+      margin: 0;
+      padding: 16px;
+      background: var(--canvas);
+      color: var(--ink);
+      font-size: 13px;
+      line-height: 1.4;
+    }
+    h1 {
+      font-family: "Syne", "DM Sans", -apple-system, sans-serif;
+      font-size: 16px;
+      margin: 0;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      color: var(--accent);
+    }
+    .hidden { display: none !important; }
+    p.sub {
+      font-size: 12px;
+      margin: 0 0 14px 0;
+      color: var(--muted);
+    }
+    button {
+      font-family: inherit;
+      padding: 9px 12px;
+      font-size: 13px;
+      font-weight: 500;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background-color 150ms ease-out, border-color 150ms ease-out, color 150ms ease-out;
+    }
+    button.primary {
+      background: var(--accent);
+      color: #ffffff;
+    }
+    button.primary:hover {
+      background: var(--accent-hover);
+    }
+    button.primary:disabled {
+      background: var(--border);
+      color: var(--muted);
+      cursor: not-allowed;
+    }
+    button.secondary {
+      background: transparent;
+      color: var(--ink);
+      border: 1px solid var(--ink);
+    }
+    button.secondary:hover {
+      background: var(--accent-tint);
+      border-color: var(--accent);
+    }
+    button.secondary:disabled {
+      color: var(--muted);
+      border-color: var(--border);
+      background: transparent;
+      cursor: not-allowed;
+    }
+    .sectionLabel {
+      font-size: 10px;
+      color: var(--muted);
+      margin: 0 0 6px 2px;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      font-weight: 600;
+    }
+    .fullSelect {
+      width: 100%;
+      padding: 9px 10px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      font-size: 13px;
+      font-family: inherit;
+      background: var(--field-bg);
+      color: var(--ink);
+    }
+    .fullSelect:hover, .fullSelect:focus {
+      border-color: var(--accent);
+      outline: none;
+    }
+    .grabFull {
+      margin-top: 8px;
+    }
+    .grabFull button {
+      width: 100%;
+    }
+    .divider {
+      text-align: center;
+      font-size: 10px;
+      color: var(--muted);
+      margin: 14px 0 10px;
+      letter-spacing: 0.6px;
+    }
+    .png button {
+      width: 100%;
+    }
+    .cancelRow {
+      margin-top: 12px;
+      display: none;
+    }
+    .cancelRow.visible {
+      display: block;
+    }
+    .cancelRow button {
+      width: 100%;
+    }
+    .settingsStrip {
+      margin-top: 16px;
+      padding-top: 14px;
+      border-top: 1px solid var(--border);
+    }
+    .settingsStrip .sectionLabel:not(:first-child) {
+      margin-top: 14px;
+    }
+    .dlSegment {
+      display: flex;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      overflow: hidden;
+      margin-bottom: 6px;
+    }
+    .dlSeg {
+      flex: 1 1 0;
+      padding: 7px 8px;
+      font-size: 12px;
+      font-weight: 500;
+      background: var(--field-bg);
+      color: var(--muted);
+      border: none;
+      border-radius: 0;
+      cursor: pointer;
+    }
+    .dlSeg + .dlSeg {
+      border-left: 1px solid var(--border);
+    }
+    .dlSeg:hover:not(.active) {
+      background: var(--accent-tint);
+      color: var(--ink);
+    }
+    .dlSeg.active {
+      background: var(--accent);
+      color: #ffffff;
+    }
+    .folderInfo {
+      padding: 2px 0 0;
+    }
+    .folderInfo.hidden {
+      display: none;
+    }
+    .folderPath {
+      display: block;
+      font-size: 11px;
+      color: var(--muted);
+      font-family: "JetBrains Mono", "IBM Plex Mono", Menlo, Consolas, monospace;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      direction: rtl;
+      text-align: left;
+    }
+    .status {
+      margin-top: 14px;
+      font-size: 12px;
+      line-height: 1.5;
+      min-height: 18px;
+      word-wrap: break-word;
+    }
+    .status.info { color: var(--muted); }
+    .status.success { color: var(--success); }
+    .status.warn { color: var(--warning); }
+    .status.error { color: var(--negative); }
+    .reveal-link { color: inherit; text-decoration: underline; cursor: pointer; }
+    .reveal-link:hover { opacity: 0.75; }
+    .progressBar {
+      margin-top: 8px;
+      height: 3px;
+      background: var(--border);
+      border-radius: 2px;
+      overflow: hidden;
+      display: none;
+    }
+    .progressBar.active {
+      display: block;
+    }
+    .progressBar .fill {
+      height: 100%;
+      width: 40%;
+      background: var(--accent);
+      border-radius: 2px;
+      animation: slide 1.4s ease-in-out infinite;
+    }
+    .progressBar.determinate .fill {
+      animation: none;
+      transition: width 0.15s linear;
+    }
+    @keyframes slide {
+      0%   { transform: translateX(-100%); }
+      50%  { transform: translateX(100%); }
+      100% { transform: translateX(250%); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .progressBar .fill { animation: none; opacity: 0.6; }
+      button { transition: opacity 100ms ease-out; }
+    }
+    .detail {
+      margin-top: 4px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .mm-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 4px;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .brand-icon {
+      flex-shrink: 0;
+      border-radius: 4px;
+    }
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 2px;
+    }
+    .icon-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 4px;
+      background: none;
+      border: none;
+      border-radius: 4px;
+      color: var(--muted);
+      cursor: pointer;
+      transition: color 0.15s ease, background 0.15s ease;
+    }
+    .icon-btn:hover {
+      color: var(--ink);
+      background: var(--accent-tint);
+    }
+    .appcaddy-wordmark {
+      font-family: "Syne", "DM Sans", -apple-system, sans-serif;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      color: var(--muted);
+      text-decoration: none;
+      margin-left: 6px;
+    }
+    .appcaddy-wordmark:hover { color: var(--accent); }
+    .field { margin-bottom: 12px; }
+    .field-head {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-bottom: 6px;
+    }
+    .pref-label { font-size: 12px; font-weight: 600; color: var(--ink); }
+    .info-btn {
+      width: 16px;
+      height: 16px;
+      padding: 0;
+      border: 1px solid var(--border);
+      border-radius: 50%;
+      background: transparent;
+      color: var(--muted);
+      font-family: Georgia, "Times New Roman", serif;
+      font-style: italic;
+      font-size: 11px;
+      line-height: 1;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .info-btn:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+      background: var(--accent-tint);
+    }
+    .field-info {
+      margin: 6px 0 0;
+      font-size: 11px;
+      line-height: 1.45;
+      color: var(--muted);
+    }
+    .field-info[hidden] { display: none; }
+    .pref-select {
+      width: 100%;
+      padding: 8px 10px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      font-size: 13px;
+      font-family: inherit;
+      background: var(--field-bg);
+      color: var(--ink);
+    }
+    .pref-select:hover, .pref-select:focus {
+      border-color: var(--accent);
+      outline: none;
+    }
+    .mm-about { font-size: 12px; color: var(--muted); margin: 0 0 4px; }
+    .mm-support-btn {
+      display: inline-block;
+      padding: 8px 14px;
+      border-radius: 6px;
+      background: var(--accent);
+      color: #ffffff;
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 500;
+      transition: background-color 150ms ease-out;
+    }
+    .mm-support-btn:hover { background: var(--accent-hover); }
+
+    /* Side panel renders the same UI as the popup but fills the panel width
+       instead of the fixed 320px popup width. */
+    html[data-layout="sidebar"] body {
+      width: auto;
+      max-width: 480px;
+    }

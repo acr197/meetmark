@@ -1,1 +1,38 @@
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+*~
+
+# Claude / agent dev files (not shipped)
 .claude/
+CLAUDE.md
+AGENTS.md
+
+# Secrets / environment
+.env
+.env.*
+*.pem
+*.key
+secrets.json
+
+# Node (if used for tooling/tests)
+node_modules/
+npm-debug.log*
+yarn-error.log
+
+# Build / packaging artifacts
+dist/
+build/
+*.zip
+*.crx
+*.xpi
+web-ext-artifacts/
+
+# Logs
+*.log

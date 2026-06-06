@@ -30,6 +30,9 @@ document.addEventListener("DOMContentLoaded", () => {
   const dlSegAsk = document.getElementById("dlSegAsk");
   const folderInfo = document.getElementById("folderInfo");
   const folderPathEl = document.getElementById("folderPath");
+  const themeSelect = document.getElementById("themeSelect");
+  const openInSelect = document.getElementById("openInSelect");
+  const aboutVersion = document.getElementById("aboutVersion");
 
   // Download preferences: "auto" (default) or "ask".
   let dlMode = "auto";
@@ -53,10 +56,35 @@ document.addEventListener("DOMContentLoaded", () => {
     folderInfo.classList.toggle("hidden", !isAuto);
   }
 
-  chrome.storage.local.get(["dlMode", "savedDownloadDir"], (prefs) => {
+  // Resolve "auto" against the OS setting; "light"/"dark" force the theme.
+  function resolveDark(theme) {
+    if (theme === "dark") return true;
+    if (theme === "light") return false;
+    return !!(window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches);
+  }
+
+  // Set the resolved theme on <html> so the [data-theme] token blocks apply,
+  // and swap the header toggle icon (sun in light mode, moon in dark mode).
+  function applyTheme(theme) {
+    const dark = resolveDark(theme);
+    document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
+    const sun = document.getElementById("icon-sun");
+    const moon = document.getElementById("icon-moon");
+    if (sun) sun.classList.toggle("hidden", dark);
+    if (moon) moon.classList.toggle("hidden", !dark);
+  }
+
+  // Paint a sensible theme before storage resolves, then correct it below.
+  applyTheme("auto");
+
+  chrome.storage.local.get(["dlMode", "savedDownloadDir", "theme", "openIn"], (prefs) => {
     applyDlMode(prefs.dlMode === "ask" ? "ask" : "auto");
     savedDownloadDir = prefs.savedDownloadDir || "";
     renderFolderPath();
+    const theme = prefs.theme || "auto";
+    if (themeSelect) themeSelect.value = theme;
+    applyTheme(theme);
+    if (openInSelect) openInSelect.value = prefs.openIn === "sidebar" ? "sidebar" : "popup";
   });
 
   function setMode(mode) {
@@ -66,6 +94,77 @@ document.addEventListener("DOMContentLoaded", () => {
   }
   dlSegAuto.addEventListener("click", () => setMode("auto"));
   dlSegAsk.addEventListener("click", () => setMode("ask"));
+
+  // Theme control — persist and apply immediately.
+  if (themeSelect) {
+    themeSelect.addEventListener("change", () => {
+      const theme = themeSelect.value;
+      chrome.storage.local.set({ theme });
+      applyTheme(theme);
+    });
+  }
+
+  // Open-in control. Persist the choice and tell the service worker which
+  // surface the toolbar icon should open. No-op on Firefox, which opens its
+  // sidebar from the browser's own UI.
+  if (openInSelect) {
+    openInSelect.addEventListener("change", () => {
+      const openIn = openInSelect.value === "sidebar" ? "sidebar" : "popup";
+      chrome.storage.local.set({ openIn });
+      chrome.runtime.sendMessage({ type: "MEETMARK_SET_OPEN_IN", openIn });
+    });
+  }
+
+  // Header theme toggle — a 2-state flip (light <-> dark). The 3-way
+  // Auto/Light/Dark control stays in the settings strip below.
+  const themeToggle = document.getElementById("theme-toggle");
+  if (themeToggle) {
+    themeToggle.addEventListener("click", () => {
+      const current = themeSelect ? themeSelect.value : "auto";
+      const next = resolveDark(current) ? "light" : "dark";
+      if (themeSelect) themeSelect.value = next;
+      chrome.storage.local.set({ theme: next });
+      applyTheme(next);
+    });
+  }
+
+  // Gear reveals the preferences strip, which is collapsed by default so the
+  // popup leads with its primary actions.
+  const settingsToggle = document.getElementById("settings-toggle");
+  const settingsStrip = document.getElementById("settingsStrip");
+  if (settingsToggle && settingsStrip) {
+    settingsToggle.addEventListener("click", () => {
+      const willShow = settingsStrip.hidden;
+      settingsStrip.hidden = !willShow;
+      settingsToggle.setAttribute("aria-expanded", willShow ? "true" : "false");
+      if (willShow) settingsStrip.scrollIntoView({ block: "nearest" });
+    });
+  }
+
+  // Re-resolve when the OS theme flips and the user is on Auto.
+  if (window.matchMedia) {
+    window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => {
+      const theme = themeSelect ? themeSelect.value : "auto";
+      if (theme === "auto") applyTheme("auto");
+    });
+  }
+
+  // Info circles — toggle the per-setting description.
+  document.querySelectorAll(".info-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const field = btn.closest(".field");
+      const info = field && field.querySelector(".field-info");
+      if (!info) return;
+      const open = btn.getAttribute("aria-expanded") === "true";
+      btn.setAttribute("aria-expanded", open ? "false" : "true");
+      info.hidden = open;
+    });
+  });
+
+  // About — read the version straight from the manifest.
+  if (aboutVersion) {
+    aboutVersion.textContent = "v" + chrome.runtime.getManifest().version;
+  }
 
   // Exactly one of these is active at a time. The cancel button talks to
   // whichever is set.

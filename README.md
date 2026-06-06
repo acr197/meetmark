@@ -36,3 +36,7 @@ A browser extension that exports Microsoft Teams meeting transcripts from ShareP
 ### Firefox
 1. Go to `about:debugging` > This Firefox > Load Temporary Add-on
 2. Select `manifest.json` from this folder
+
+## Colophon
+
+Published by AppCaddy.

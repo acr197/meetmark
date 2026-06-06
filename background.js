@@ -20,6 +20,34 @@
 // Data URLs work from an MV3 service worker where Blob URLs are not
 // supported.
 
+// ---------------------------------------------------------------------------
+// Open-in behavior. The toolbar icon opens either the popup or the side panel,
+// controlled by the "openIn" preference. Chrome only: chrome.sidePanel does
+// not exist in Firefox, so this is a no-op there and the sidebar opens from
+// the browser's own UI.
+// ---------------------------------------------------------------------------
+
+async function applyOpenInBehavior(openIn) {
+  if (!(chrome.sidePanel && chrome.sidePanel.setPanelBehavior)) return;
+  const useSidebar = openIn === "sidebar";
+  try {
+    await chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: useSidebar });
+  } catch (err) {
+    console.warn("[MeetMark] setPanelBehavior failed:", (err && err.message) || err);
+  }
+  // Clearing the popup lets the toolbar click open the side panel instead.
+  chrome.action.setPopup({ popup: useSidebar ? "" : "popup.html" });
+}
+
+// Read the stored preference and apply it on install and on browser startup.
+function initOpenInBehavior() {
+  chrome.storage.local.get(["openIn"], (prefs) => {
+    applyOpenInBehavior(prefs && prefs.openIn === "sidebar" ? "sidebar" : "popup");
+  });
+}
+chrome.runtime.onInstalled.addListener(initOpenInBehavior);
+chrome.runtime.onStartup.addListener(initOpenInBehavior);
+
 function utf8ToBase64(str) {
   const bytes = new TextEncoder().encode(str);
   let binary = "";
@@ -103,7 +131,19 @@ function openPrintTab(html, sendResponse) {
 }
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
-  if (!message || message.type !== "MEETMARK_DOWNLOAD") {
+  if (!message) {
+    return false;
+  }
+
+  // Open-in toggle from the popup or side panel.
+  if (message.type === "MEETMARK_SET_OPEN_IN") {
+    applyOpenInBehavior(message.openIn === "sidebar" ? "sidebar" : "popup").then(() =>
+      sendResponse({ ok: true })
+    );
+    return true;
+  }
+
+  if (message.type !== "MEETMARK_DOWNLOAD") {
     return false;
   }
 
