@@ -15,12 +15,20 @@
 // scroller. The popup is told which viewport rect on the captured tab
 // image corresponds to the scrollable region so it can crop before
 // stitching.
+//
+// Detection pierces open shadow roots. On Web-Component apps (Home
+// Assistant, YouTube, many design systems) the scroller is a <div> nested
+// inside one or more shadow roots, which a flat document.querySelectorAll
+// cannot see — so without shadow piercing we found no scroller and emitted
+// a single-viewport PNG. Closed shadow roots and cross-origin iframes are
+// still out of reach for a content script.
 
 (function () {
-  if (window.__meetmarkShotLoaded) {
-    return;
-  }
-  window.__meetmarkShotLoaded = true;
+  // Bump this whenever screenshot.js changes so you can confirm in the page
+  // console which copy actually ran. The injected script lives for the life of
+  // the tab (see the listener-replacement note below).
+  var VERSION = "1.6.1";
+  console.log("[MeetMark] screenshot.js " + VERSION + " ready (shadow-DOM aware)");
 
   // Minimum post-scroll pause before capturing. 400 ms gives virtualized grids
   // (e.g. Smartsheet) enough time to update row transforms after a scroll event.
@@ -30,7 +38,22 @@
   // GoFullPage uses.
   var STICKY_PAD = 200;
 
-  chrome.runtime.onConnect.addListener(function (port) {
+  // Replace any listener installed by a previously-injected copy, so editing
+  // screenshot.js takes effect on re-injection WITHOUT a full tab reload. The
+  // old `__meetmarkShotLoaded` guard made the FIRST-injected copy win for the
+  // life of the tab, which silently kept running stale code after an update —
+  // exactly the trap that made a shadow-DOM page look "unfixed". After an
+  // extension *reload* the stored reference belongs to an invalidated context,
+  // so removeListener is a harmless no-op and we just install the fresh one.
+  if (window.__meetmarkShotListener) {
+    try {
+      chrome.runtime.onConnect.removeListener(window.__meetmarkShotListener);
+    } catch (_) {}
+  }
+  window.__meetmarkShotListener = onMeetmarkShotConnect;
+  chrome.runtime.onConnect.addListener(onMeetmarkShotConnect);
+
+  function onMeetmarkShotConnect(port) {
     if (port.name !== "meetmark-shot") return;
 
     var cancelled = false;
@@ -317,113 +340,243 @@
         ackResolver = resolve;
       });
     }
-  });
+  }
 
-  // Pick the scrollable target. If an inner element has taller scrollable
-  // content than the document root, use it; otherwise drive the window.
+  // Pick what to scroll. The page root and every inner element compete in one
+  // pool, scored the same way, so we choose the genuinely-biggest scroller
+  // instead of hard-coding a "root vs inner" rule. Detection pierces shadow
+  // DOM (see walkDeep), which is what makes this work on Home Assistant and
+  // other Web-Component apps.
   function pickScrollTarget() {
     var docEl = document.documentElement;
     var body = document.body;
+    var vw = window.innerWidth;
+    var vh = window.innerHeight;
 
-    var inner = findTallestInnerScroller();
+    var rootScrollH = Math.max(docEl.scrollHeight, body ? body.scrollHeight : 0);
+    var rootDist = Math.max(0, rootScrollH - vh);
 
-    var rootScrollHeight = Math.max(
-      docEl.scrollHeight,
-      body ? body.scrollHeight : 0
-    );
-    var innerScrollHeight = inner ? inner.scrollHeight : 0;
+    var candidates = findScrollCandidates();
 
-    var rootScrolls =
-      docEl.scrollHeight > docEl.clientHeight + 1 ||
-      (body && body.scrollHeight > body.clientHeight + 1);
+    // A candidate qualifies as the main content well only if it scrolls a
+    // meaningful amount AND is both wide and tall on screen. The width gate is
+    // what rejects scrolling sidebars / nav rails: they are tall but narrow.
+    var MIN_SCROLL = 8;
+    var eligible = candidates.filter(function (c) {
+      return (
+        c.scrollDistance >= MIN_SCROLL &&
+        c.visWFrac >= 0.4 &&
+        c.visHFrac >= 0.35
+      );
+    });
 
-    // Inner wins when it has meaningfully more hidden content than the root,
-    // or when the root doesn't actually scroll (overflow:hidden dashboards).
-    if (inner && (!rootScrolls || innerScrollHeight > rootScrollHeight * 1.1)) {
-      return { mode: "element", el: inner };
+    logCandidates(candidates, eligible);
+
+    // Nothing qualified. Drive the window if the document scrolls; otherwise
+    // the page already fits in one viewport (a single screenshot is correct).
+    if (eligible.length === 0) {
+      console.log(
+        "[MeetMark] no inner scroller qualified; using window (root scrollDistance=" +
+          rootDist +
+          ")"
+      );
+      return { mode: "window", el: null };
     }
-    return { mode: "window", el: null };
+
+    // Most vertical scroll distance wins. Among candidates within 20% of the
+    // leader, prefer the larger visible area, then the one centered
+    // horizontally (content wells sit center; side panels do not).
+    var viewportArea = vw * vh || 1;
+    var centerX = vw / 2;
+    eligible.sort(function (a, b) {
+      return b.scrollDistance - a.scrollDistance;
+    });
+    var lead = eligible[0].scrollDistance;
+    var near = eligible.filter(function (c) {
+      return c.scrollDistance >= lead * 0.8;
+    });
+    near.sort(function (a, b) {
+      if (Math.abs(b.area - a.area) > viewportArea * 0.05) {
+        return b.area - a.area;
+      }
+      var aMid = Math.abs(a.rect.left + a.rect.width / 2 - centerX);
+      var bMid = Math.abs(b.rect.left + b.rect.width / 2 - centerX);
+      return aMid - bMid;
+    });
+    var chosen = near[0];
+
+    // If the window scrolls farther than the best inner candidate, the window
+    // is probably the real scroller (e.g. a long article that merely contains
+    // a scrollable code block). Prefer it.
+    if (rootDist > chosen.scrollDistance) {
+      console.log(
+        "[MeetMark] window scrolls farther (" +
+          rootDist +
+          ") than best inner (" +
+          chosen.scrollDistance +
+          "); using window"
+      );
+      return { mode: "window", el: null };
+    }
+
+    console.log(
+      "[MeetMark] scroll target:",
+      describeEl(chosen.el),
+      "scrollDistance=" + chosen.scrollDistance,
+      "areaFrac=" + chosen.areaFrac.toFixed(2)
+    );
+    if (near.length > 1) {
+      console.log(
+        "[MeetMark] note: " +
+          near.length +
+          " comparably-sized scrollers exist; captured the largest/most central one."
+      );
+    }
+    return { mode: "element", el: chosen.el };
   }
 
-  // Walk the DOM and collect all vertically scrollable elements (overflow
-  // auto/scroll, scrollHeight > clientHeight). Pick the tallest one; if two
-  // candidates are within 20% of each other, prefer the one whose horizontal
-  // midpoint is closest to the viewport center (content wells beat sidebars).
-  function findTallestInnerScroller() {
-    var candidates = [];
-    var nodes = document.querySelectorAll("*");
-    for (var i = 0; i < nodes.length; i++) {
-      var el = nodes[i];
-      if (el === document.documentElement || el === document.body) continue;
+  // Visit every element in the document, descending into open shadow roots.
+  // `visit(el)` may return false to stop the walk early. Node-capped so a
+  // pathological DOM can't hang the capture. This is the key to finding
+  // scrollers on Web-Component apps, where the scroller lives inside nested
+  // shadow roots that a flat document.querySelectorAll("*") never sees.
+  function walkDeep(visit) {
+    var MAX_NODES = 120000;
+    var seen = 0;
+    var stack = [document];
+    while (stack.length) {
+      var root = stack.pop();
+      var kids;
+      try {
+        kids = root.querySelectorAll("*");
+      } catch (_) {
+        continue;
+      }
+      for (var i = 0; i < kids.length; i++) {
+        var el = kids[i];
+        if (++seen > MAX_NODES) return;
+        if (visit(el) === false) return;
+        // Open shadow roots only; closed roots report null and are skipped.
+        if (el.shadowRoot) stack.push(el.shadowRoot);
+      }
+    }
+  }
 
-      if (el.scrollHeight <= el.clientHeight + 1) continue;
+  // Collect every element that scrolls vertically, with the geometry we need
+  // to decide which one is the page's main content region. Pierces shadow DOM.
+  function findScrollCandidates() {
+    var vw = window.innerWidth;
+    var vh = window.innerHeight;
+    var viewportArea = vw * vh || 1;
+    var out = [];
+
+    walkDeep(function (el) {
+      if (el === document.documentElement || el === document.body) return;
+
+      var vDist = el.scrollHeight - el.clientHeight;
+      var hDist = el.scrollWidth - el.clientWidth;
+      if (vDist <= 1 && hDist <= 1) return;
 
       var cs;
       try {
         cs = getComputedStyle(el);
       } catch (_) {
-        continue;
+        return;
       }
       var oy = cs.overflowY;
-      if (oy !== "auto" && oy !== "scroll" && oy !== "overlay") continue;
+      var ox = cs.overflowX;
+      var scrollsY =
+        (oy === "auto" || oy === "scroll" || oy === "overlay") && vDist > 1;
+      var scrollsX =
+        (ox === "auto" || ox === "scroll" || ox === "overlay") && hDist > 1;
+      if (!scrollsY && !scrollsX) return;
 
       var rect;
       try {
         rect = el.getBoundingClientRect();
       } catch (_) {
-        continue;
-      }
-      // Skip elements narrower/shorter than 40% of the viewport — sidebars
-      // and tooltip containers are never the main content well.
-      if (
-        rect.width < window.innerWidth * 0.4 ||
-        rect.height < window.innerHeight * 0.4
-      ) {
-        continue;
+        return;
       }
 
-      candidates.push({ el: el, scrollHeight: el.scrollHeight, rect: rect });
-    }
+      // Portion of the element actually on screen. A real content well fills
+      // most of the viewport; popups, tooltips and log panes do not.
+      var visW = Math.max(0, Math.min(rect.right, vw) - Math.max(rect.left, 0));
+      var visH = Math.max(0, Math.min(rect.bottom, vh) - Math.max(rect.top, 0));
+      var area = visW * visH;
 
-    if (candidates.length === 0) return null;
-
-    // Sort tallest first.
-    candidates.sort(function (a, b) {
-      return b.scrollHeight - a.scrollHeight;
-    });
-
-    // Among candidates within 20% of the tallest, prefer the one whose
-    // midpoint is closest to the horizontal center of the viewport.
-    var topHeight = candidates[0].scrollHeight;
-    var similar = candidates.filter(function (c) {
-      return c.scrollHeight >= topHeight * 0.8;
-    });
-
-    var chosen;
-    if (similar.length > 1) {
-      var centerX = window.innerWidth / 2;
-      chosen = similar.reduce(function (a, b) {
-        var aMid = a.rect.left + a.rect.width / 2;
-        var bMid = b.rect.left + b.rect.width / 2;
-        return Math.abs(aMid - centerX) <= Math.abs(bMid - centerX) ? a : b;
+      out.push({
+        el: el,
+        rect: rect,
+        area: area,
+        areaFrac: area / viewportArea,
+        visWFrac: visW / vw,
+        visHFrac: visH / vh,
+        scrollsY: scrollsY,
+        scrollDistance: scrollsY ? vDist : 0,
+        hScrollDistance: scrollsX ? hDist : 0,
+        scrollHeight: el.scrollHeight,
       });
-    } else {
-      chosen = candidates[0];
-    }
+    });
 
+    return out;
+  }
+
+  // Human-readable element descriptor for the console, including which shadow
+  // host it lives under (so you can find it again in the Elements panel).
+  function describeEl(el) {
     var cls =
-      typeof chosen.el.className === "string"
-        ? chosen.el.className.trim() || "(none)"
-        : "(none)";
-    console.log(
-      "[MeetMark] scroll target selected:",
-      chosen.el.tagName,
-      "id=" + (chosen.el.id || "(none)"),
-      "class=" + cls,
-      "scrollHeight=" + chosen.scrollHeight
+      typeof el.className === "string"
+        ? el.className.trim()
+        : (el.getAttribute && el.getAttribute("class")) || "";
+    var host = "";
+    try {
+      var root = el.getRootNode && el.getRootNode();
+      if (root && root.host) {
+        host = " (inside <" + root.host.tagName.toLowerCase() + "> shadow root)";
+      }
+    } catch (_) {}
+    return (
+      "<" +
+      el.tagName.toLowerCase() +
+      (el.id ? "#" + el.id : "") +
+      (cls ? "." + cls.split(/\s+/).slice(0, 3).join(".") : "") +
+      ">" +
+      host
     );
+  }
 
-    return chosen.el;
+  // Dump the full candidate list so a misbehaving page can be diagnosed from
+  // the tab's console without rebuilding the extension.
+  function logCandidates(all, eligible) {
+    try {
+      console.log(
+        "[MeetMark] scroll scan: " +
+          all.length +
+          " scrollable element(s) found (shadow DOM included), " +
+          eligible.length +
+          " qualify as main content"
+      );
+      all
+        .slice()
+        .sort(function (a, b) {
+          return b.scrollDistance - a.scrollDistance;
+        })
+        .slice(0, 12)
+        .forEach(function (c) {
+          console.log(
+            "  " +
+              (eligible.indexOf(c) >= 0 ? "[main]" : "      ") +
+              " " +
+              describeEl(c.el) +
+              "  scrollDist=" +
+              c.scrollDistance +
+              " visWFrac=" +
+              c.visWFrac.toFixed(2) +
+              " visHFrac=" +
+              c.visHFrac.toFixed(2)
+          );
+        });
+    } catch (_) {}
   }
 
   // Scroll the target to (x, y) using incremental scrollTop += delta so that
@@ -517,28 +670,29 @@
   function hideFixedElements() {
     var hidden = [];
     try {
-      var nodes = document.querySelectorAll("*");
-      for (var i = 0; i < nodes.length; i++) {
-        var el = nodes[i];
-        if (el === document.documentElement || el === document.body) continue;
+      // Pierce shadow DOM so sticky headers inside component apps (e.g. Home
+      // Assistant's top app bar) are hidden too, instead of stamping into
+      // every tile.
+      walkDeep(function (el) {
+        if (el === document.documentElement || el === document.body) return;
         var cs;
         try {
           cs = getComputedStyle(el);
         } catch (_) {
-          continue;
+          return;
         }
         var pos = cs.position;
-        if (pos !== "fixed" && pos !== "sticky") continue;
+        if (pos !== "fixed" && pos !== "sticky") return;
         // Skip elements that are already invisible — no need to track them.
-        if (cs.display === "none" || cs.visibility === "hidden") continue;
+        if (cs.display === "none" || cs.visibility === "hidden") return;
         // Skip zero-size elements (they wouldn't appear in the capture anyway).
         try {
           var r = el.getBoundingClientRect();
-          if (r.width === 0 && r.height === 0) continue;
+          if (r.width === 0 && r.height === 0) return;
         } catch (_) {}
         hidden.push({ el: el, visibility: el.style.visibility });
         el.style.setProperty("visibility", "hidden", "important");
-      }
+      });
     } catch (_) {}
     return hidden;
   }
